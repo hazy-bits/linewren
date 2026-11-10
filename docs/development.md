@@ -22,6 +22,8 @@ runs in the fastest appropriate layer.
 
 ## Where changes belong
 
+Application code and Toolbox resources live in `src/`.
+
 - `main.c` coordinates the event loop, menus, windows, and temporary UI.
   Find works on the current document. Quick Open navigates the workspace.
 - `editor-atsui.c` owns the buffer, selection, edit history, and layout.

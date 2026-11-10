@@ -19,8 +19,7 @@
   default branch. It serves `site/` directly. When the subdomain is confirmed,
   configure it in GitHub Pages and point its DNS CNAME at the organization’s
   Pages host. Enable HTTPS after GitHub verifies DNS.
-- Replace the README coffee button’s placeholder link with the confirmed
-  payment URL. Add the project origin story when the author supplies it.
+- Add the project origin story when the author supplies it.
 
 The app bundles no Apple SDK files. Retro68 provides the build toolchain.
 The vendored smoke harness is a snapshot from ClassicMacAppTemplate at

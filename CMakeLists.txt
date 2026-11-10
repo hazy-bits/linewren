@@ -7,11 +7,11 @@ if(LINEWREN_SMOKE_TEST)
                      ${CMAKE_CURRENT_BINARY_DIR}/classic-test)
 endif()
 
-set(editor_source editor-atsui.c document.c markdown.c markdown-presentation.c
-                  text-files.c settings.c workspace.c vendor/md4c/md4c.c)
+set(editor_source src/editor-atsui.c src/document.c src/markdown.c src/markdown-presentation.c
+                  src/text-files.c src/settings.c src/workspace.c vendor/md4c/md4c.c)
 
 option(LINEWREN_FONT_SPECIMENS "Capture the bundled fonts in a running ATSUI editor" OFF)
-set(linewren_resources Linewren.r assets/icons/bundle.r assets/icons/classic.r)
+set(linewren_resources src/Linewren.r assets/icons/bundle.r assets/icons/classic.r)
 if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
     set(LINEWREN_OSX_ICONS tiger CACHE STRING "Icon artwork for the Carbon build")
     set_property(CACHE LINEWREN_OSX_ICONS PROPERTY STRINGS tiger leopard)
@@ -34,9 +34,9 @@ if(LINEWREN_FONT_SPECIMENS)
     if(LINEWREN_SMOKE_TEST)
         message(FATAL_ERROR "Font specimens require the interactive ATSUI backend")
     endif()
-    list(APPEND editor_source font-specimens.c)
+    list(APPEND editor_source src/font-specimens.c)
 endif()
-list(APPEND editor_source bundled-fonts.c)
+list(APPEND editor_source src/bundled-fonts.c)
 set(font_resources "${CMAKE_CURRENT_BINARY_DIR}/bundled-fonts.r")
 file(WRITE "${font_resources}" "")
 set(resource_id 200)
@@ -54,7 +54,7 @@ endforeach()
 list(APPEND linewren_resources "${font_resources}")
 
 add_application(Linewren
-    main.c
+    src/main.c
     ${editor_source}
     ${linewren_resources}
     CREATOR 'Lnwr'
@@ -62,8 +62,9 @@ add_application(Linewren
 
 target_compile_definitions(Linewren PRIVATE MD4C_USE_UTF16)
 target_compile_features(Linewren PRIVATE c_std_11)
+target_include_directories(Linewren PRIVATE vendor/md4c)
 if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
-    target_sources(Linewren PRIVATE carbon-alloc.c)
+    target_sources(Linewren PRIVATE src/carbon-alloc.c)
     target_compile_definitions(Linewren PRIVATE realloc=LinewrenCarbonRealloc)
 else()
     target_link_libraries(Linewren PRIVATE NavigationLib InputSprocketLib ATSUnicodeLib

@@ -62,9 +62,7 @@ models (LLMs), including for code, tests, and documentation.
 
 ## Support
 
-[![Buy me a coffee](assets/buy-me-a-coffee.svg)](#support)
-
-The support button is a placeholder until the project’s payment link is set.
+<a href="https://buymeacoffee.com/hazybits"><img src="site/assets/buy-me-a-coffee.png" alt="Buy Me a Coffee" width="164" height="46"></a>
 
 ## Third-party components
 

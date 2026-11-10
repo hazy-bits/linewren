@@ -1,5 +1,5 @@
 #include "markdown.h"
-#include "vendor/md4c/md4c.h"
+#include "md4c.h"
 
 #include <stdlib.h>
 #include <string.h>
