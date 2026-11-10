@@ -1,0 +1,8 @@
+result
+result-*
+build
+/release/
+.DS_Store
+__pycache__/
+.direnv
+/.vscode/settings.json

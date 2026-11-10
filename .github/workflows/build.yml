@@ -1,0 +1,36 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  powerpc:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://autc04.cachix.org
+            extra-trusted-public-keys = autc04.cachix.org-1:MyPhhbTlMACU1jhpdXlPlU4R4gyDEeNbuVYi/dU/2iU=
+      - name: Run host tests and compile both guest smoke suites
+        run: |
+          ./scripts/test-local.sh
+          nix build .#powerpc-smoke .#powerpc-osx-smoke --no-link
+      - name: Build and verify the release archives
+        run: ./scripts/package-release.sh release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: Linewren-PowerPC
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0

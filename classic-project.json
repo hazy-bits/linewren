@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "application": "Linewren",
+  "runTarget": "powerpc",
+  "testTarget": "powerpc-smoke",
+  "testTimeoutSeconds": 30
+}
