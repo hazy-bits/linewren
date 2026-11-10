@@ -15,8 +15,9 @@
   ./scripts/package-release.sh release
   ```
 
-- Enable GitHub Actions as the Pages source and run **Publish website** from the
-  default branch. It serves `site/` directly. When the subdomain is confirmed,
+- Enable GitHub Actions as the Pages source. **Publish website** serves `site/`
+  directly after changes to the site or its workflow on the default branch.
+  It can also run manually. When the subdomain is confirmed,
   configure it in GitHub Pages and point its DNS CNAME at the organization’s
   Pages host. Enable HTTPS after GitHub verifies DNS.
 - Add the project origin story when the author supplies it.
