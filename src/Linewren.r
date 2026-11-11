@@ -113,12 +113,6 @@ resource 'MBAR' (128) {
     { 128, 129, 130 };
 };
 
-data 'TEXT' (128) {
-    "Linewren 0.2\r\r"
-    "A quiet place to write on a classic Macintosh.\r\r"
-    "Portable text files, comfortable ATSUI typography, and just enough organization."
-};
-
 resource 'WIND' (128) {
     {0, 0, 190, 340}, altDBoxProc;
     invisible;

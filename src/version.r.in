@@ -1,0 +1,12 @@
+#include "MacTypes.r"
+
+resource 'vers' (1) {
+    @version_major_bcd@, @version_minor_patch_bcd@, @version_stage@, 0,
+    0, "@linewren_version@", "Linewren @linewren_version@"
+};
+
+data 'TEXT' (128) {
+    "Linewren @linewren_version@\r\r"
+    "A quiet place to write on a classic Macintosh.\r\r"
+    "Portable text files, comfortable ATSUI typography, and just enough organization."
+};

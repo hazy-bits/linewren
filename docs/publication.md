@@ -3,13 +3,24 @@
 - The publication repository is [hazy-bits/linewren](https://github.com/hazy-bits/linewren).
   The first push starts with a snapshot of the reviewed source. The development
   history contains a personal author email and a local checkout path.
-- Push the reviewed source and run **Build and test**. It runs the portable suite,
-  compiles both guest smoke builds, and uploads the Mac OS 9 ZIP and the Tiger
-  and Leopard DMGs.
-  It does not run a vintage OS guest.
-- Confirm the app license before the first public release.
-- Test the three archives on the target systems and attach them to the first
-  GitHub release. The same packaging command is available on a macOS host.
+- Set the next release number in `VERSION` and push the changes to `main`.
+  **Build and test** runs the portable tests, compiles both guest smoke builds,
+  and uploads the Mac OS 9 ZIP and the Tiger and Leopard DMGs. Untagged CI builds
+  add `-dev.<run>.<attempt>` to the version in the app and archive names.
+- When the commit is ready to release, tag it with `v` followed by its
+  `VERSION`. For the first release, use `v0.2.0`.
+
+  ```sh
+  git fetch origin main
+  git tag -a v0.2.0 origin/main -m "Linewren 0.2.0"
+  git push origin v0.2.0
+  ```
+
+  GitHub Actions checks the tag, builds all three archives with the release
+  version, and attaches them to a draft GitHub release. Review the release
+  notes and test the archives on the target systems before publishing the draft.
+- Confirm the app license before the first public release. To build the same
+  archives locally on macOS, run the packaging script from the repository root.
 
   ```sh
   ./scripts/package-release.sh release

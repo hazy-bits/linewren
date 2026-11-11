@@ -3,6 +3,7 @@ name: Build and test
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -13,10 +14,31 @@ jobs:
   powerpc:
     runs-on: macos-15
     timeout-minutes: 35
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Set build version
+        id: version
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]?)\.[0-9]\.[0-9]$ ]]; then
+            echo "::error::VERSION must be a numeric release version (major 0–99, minor and patch 0–9)."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME must match VERSION (v$version)."
+              exit 1
+            fi
+          else
+            version="$version-dev.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+            printf '%s\n' "$version" > VERSION
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
@@ -30,7 +52,42 @@ jobs:
         run: ./scripts/package-release.sh release
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: Linewren-PowerPC
+          name: Linewren-${{ steps.version.outputs.version }}-PowerPC
           path: release/*
           if-no-files-found: error
           compression-level: 0
+
+  draft-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: powerpc
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: Linewren-${{ needs.powerpc.outputs.version }}-PowerPC
+          path: release
+      - name: Attach binaries to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.powerpc.outputs.version }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! release=$(gh release view "$tag" --json isDraft,assets); then
+            gh release create "$tag" --draft --verify-tag --generate-notes --title "Linewren $VERSION"
+            release=$(gh release view "$tag" --json isDraft,assets)
+          fi
+          if [[ $(jq -r '.isDraft' <<< "$release") != true ]]; then
+            echo "Release $tag is already published."
+            exit 0
+          fi
+          for asset in "Linewren-$VERSION-Mac-OS-9.zip" \
+                       "Linewren-$VERSION-PowerPC-Tiger.dmg" \
+                       "Linewren-$VERSION-PowerPC-Leopard.dmg"; do
+            if ! jq -e --arg name "$asset" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
+              gh release upload "$tag" "release/$asset"
+            fi
+          done

@@ -1,6 +1,19 @@
 cmake_minimum_required(VERSION 3.27)
 project(Linewren C)
 
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS VERSION)
+file(STRINGS VERSION linewren_version)
+if(NOT linewren_version MATCHES "^(0|[1-9][0-9]?)\\.([0-9])\\.([0-9])(-dev\\.[0-9]+\\.[0-9]+)?$")
+    message(FATAL_ERROR "Invalid VERSION: ${linewren_version}")
+endif()
+set(version_major_bcd "0x${CMAKE_MATCH_1}")
+set(version_minor_patch_bcd "0x${CMAKE_MATCH_2}${CMAKE_MATCH_3}")
+set(version_stage final)
+if(CMAKE_MATCH_4)
+    set(version_stage development)
+endif()
+configure_file(src/version.r.in version.r @ONLY)
+
 option(LINEWREN_SMOKE_TEST "Run a self-test and exit instead of waiting for input" OFF)
 if(LINEWREN_SMOKE_TEST)
     add_subdirectory(vendor/classic-mac-app/guest
@@ -11,7 +24,8 @@ set(editor_source src/editor-atsui.c src/document.c src/markdown.c src/markdown-
                   src/text-files.c src/settings.c src/workspace.c vendor/md4c/md4c.c)
 
 option(LINEWREN_FONT_SPECIMENS "Capture the bundled fonts in a running ATSUI editor" OFF)
-set(linewren_resources src/Linewren.r assets/icons/bundle.r assets/icons/classic.r)
+set(linewren_resources src/Linewren.r assets/icons/bundle.r assets/icons/classic.r
+                       "${CMAKE_CURRENT_BINARY_DIR}/version.r")
 if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
     set(LINEWREN_OSX_ICONS tiger CACHE STRING "Icon artwork for the Carbon build")
     set_property(CACHE LINEWREN_OSX_ICONS PROPERTY STRINGS tiger leopard)
@@ -60,7 +74,7 @@ add_application(Linewren
     CREATOR 'Lnwr'
 )
 
-target_compile_definitions(Linewren PRIVATE MD4C_USE_UTF16)
+target_compile_definitions(Linewren PRIVATE MD4C_USE_UTF16 LINEWREN_VERSION="${linewren_version}")
 target_compile_features(Linewren PRIVATE c_std_11)
 target_include_directories(Linewren PRIVATE vendor/md4c)
 if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")

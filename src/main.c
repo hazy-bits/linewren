@@ -568,7 +568,10 @@ static void ShowAboutBox(void)
 {
 #if TARGET_API_MAC_CARBON
     short button;
-    StandardAlert(kAlertNoteAlert, "\pAbout Linewren",
+    Str255 title;
+    title[0] = snprintf((char *)title + 1, sizeof(title) - 1,
+                        "Linewren %s", LINEWREN_VERSION);
+    StandardAlert(kAlertNoteAlert, title,
                   "\pA quiet place to write.\r\rMarkdown and plain text for PowerPC Mac OS X.",
                   NULL, &button);
 #else

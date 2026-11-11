@@ -22,6 +22,8 @@
         let
           retro = inputs'.Retro68;
           tools = retro.packages.tools;
+          version = pkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
+          classicArchive = "Linewren-${version}-Mac-OS-9.zip";
           build =
             architecture: suffix: cmakeFlags:
             let
@@ -38,7 +40,7 @@
               };
             in
             stdenv.mkDerivation {
-              name = "Linewren" + suffix;
+              name = "Linewren-${version}" + suffix;
               src = ./.;
               inherit cmakeFlags;
               nativeBuildInputs = [
@@ -70,12 +72,12 @@
             powerpc-font-specimens = build "powerpc" "-font-specimens" [ "-DLINEWREN_FONT_SPECIMENS=ON" ];
             retro68-tools = tools;
             classic-runner = runner;
-            distribution = pkgs.runCommand "Linewren-Mac-OS-9" { nativeBuildInputs = [ pkgs.zip ]; } ''
+            distribution = pkgs.runCommand "Linewren-${version}-Mac-OS-9" { nativeBuildInputs = [ pkgs.zip ]; } ''
               mkdir -p "$out/Linewren/Fonts"
               cp ${powerpc}/Linewren.bin "$out/Linewren/"
               cp ${./fonts}/* "$out/Linewren/Fonts/"
               cd "$out"
-              zip -qr Linewren-Mac-OS-9.zip Linewren
+              zip -qr ${pkgs.lib.escapeShellArg classicArchive} Linewren
             '';
           };
 

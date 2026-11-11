@@ -10,9 +10,9 @@ folders of ordinary UTF-8 files.
 
 | System | Release file | Install |
 | --- | --- | --- |
-| Mac OS 9 | `Linewren-Mac-OS-9.zip` | Unzip, then decode `Linewren.bin` with a MacBinary-aware utility on the Mac. |
-| Mac OS X 10.4 Tiger (PowerPC) | `Linewren-PowerPC-Tiger.dmg` | Mount the image and drag Linewren to Applications. |
-| Mac OS X 10.5 Leopard (PowerPC) | `Linewren-PowerPC-Leopard.dmg` | Mount the image and drag Linewren to Applications. |
+| Mac OS 9 | `Linewren-<version>-Mac-OS-9.zip` | Unzip, then decode `Linewren.bin` with a MacBinary-aware utility on the Mac. |
+| Mac OS X 10.4 Tiger (PowerPC) | `Linewren-<version>-PowerPC-Tiger.dmg` | Mount the image and drag Linewren to Applications. |
+| Mac OS X 10.5 Leopard (PowerPC) | `Linewren-<version>-PowerPC-Leopard.dmg` | Mount the image and drag Linewren to Applications. |
 
 [GitHub releases](https://github.com/hazy-bits/linewren/releases) will carry these
 downloads. The Classic build is exercised on Mac OS 9.2.2. The Carbon build
