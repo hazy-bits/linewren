@@ -35,6 +35,8 @@ has been used on PowerPC Tiger. Leopard validation is pending.
 ## Build and test
 
 Linewren cross-compiles with [Retro68](https://github.com/autc04/Retro68) and Nix.
+Linewren grew out of the [Classic Mac App Template](https://github.com/hazy-bits/classic-mac-app-template)
+and imports its Nix build helper and guest smoke-test harness.
 Configure the [Retro68 binary cache](docs/nix-cache.md) before the first build.
 
 ```sh
@@ -66,7 +68,7 @@ models (LLMs), including for code, tests, and documentation.
 
 ## Third-party components
 
-[MD4C](vendor/md4c/LICENSE.md) and the vendored
-[Classic Mac App smoke harness](vendor/classic-mac-app/LICENSE) include their MIT
-notices. [Bundled fonts](fonts/README.md) include their SIL Open Font License
-files.
+[MD4C](vendor/md4c/LICENSE.md) and the
+[Classic Mac App Template](https://github.com/hazy-bits/classic-mac-app-template/blob/main/LICENSE)
+use the MIT License. [Bundled fonts](fonts/README.md) include their SIL Open
+Font License files.

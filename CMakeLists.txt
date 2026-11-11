@@ -16,8 +16,11 @@ configure_file(src/version.r.in version.r @ONLY)
 
 option(LINEWREN_SMOKE_TEST "Run a self-test and exit instead of waiting for input" OFF)
 if(LINEWREN_SMOKE_TEST)
-    add_subdirectory(vendor/classic-mac-app/guest
-                     ${CMAKE_CURRENT_BINARY_DIR}/classic-test)
+    if(NOT CLASSIC_MAC_HARNESS_DIR)
+        message(FATAL_ERROR "CLASSIC_MAC_HARNESS_DIR is required for smoke builds")
+    endif()
+    add_subdirectory("${CLASSIC_MAC_HARNESS_DIR}/guest"
+                     "${CMAKE_CURRENT_BINARY_DIR}/classic-test")
 endif()
 
 set(editor_source src/editor-atsui.c src/document.c src/markdown.c src/markdown-presentation.c

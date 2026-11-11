@@ -34,7 +34,5 @@
 - Add the project origin story when the author supplies it.
 
 The app bundles no Apple SDK files. Retro68 provides the build toolchain.
-The vendored smoke harness is a snapshot from ClassicMacAppTemplate at
-`d435326c71be4ef74871d52c77fe21398a1459b2`. Its copy keeps this build usable
-before the template gets a public remote. The local runner uses temporary
-working directories for LaunchAPPL reports.
+The flake lock pins the [Classic Mac App Template](https://github.com/hazy-bits/classic-mac-app-template)
+used for cross-builds and guest smoke tests.

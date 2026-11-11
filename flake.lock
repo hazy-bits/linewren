@@ -20,6 +20,34 @@
         "type": "github"
       }
     },
+    "classicMacApp": {
+      "inputs": {
+        "Retro68": [
+          "Retro68"
+        ],
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "nixpkgs": [
+          "classicMacApp",
+          "Retro68",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794388280,
+        "narHash": "sha256-B8sbah+h9KkoAKMs/LF14FmG6rEPZPq8LKNPkmLtcY8=",
+        "owner": "hazy-bits",
+        "repo": "classic-mac-app-template",
+        "rev": "834ca1082ca409701b0449b68a5177c58d0efede",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hazy-bits",
+        "repo": "classic-mac-app-template",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": "nixpkgs-lib"
@@ -121,6 +149,7 @@
     "root": {
       "inputs": {
         "Retro68": "Retro68",
+        "classicMacApp": "classicMacApp",
         "flake-parts": "flake-parts_2",
         "nixpkgs": [
           "Retro68",
