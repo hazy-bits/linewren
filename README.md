@@ -66,6 +66,10 @@ models (LLMs), including for code, tests, and documentation.
 
 <a href="https://buymeacoffee.com/hazybits"><img src="site/assets/buy-me-a-coffee.png" alt="Buy Me a Coffee" width="164" height="46"></a>
 
+## License
+
+Linewren is available under the [MIT License](LICENSE).
+
 ## Third-party components
 
 [MD4C](vendor/md4c/LICENSE.md) and the

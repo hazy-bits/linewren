@@ -29,6 +29,12 @@ set(editor_source src/editor-atsui.c src/document.c src/markdown.c src/markdown-
 option(LINEWREN_FONT_SPECIMENS "Capture the bundled fonts in a running ATSUI editor" OFF)
 set(linewren_resources src/Linewren.r assets/icons/bundle.r assets/icons/classic.r
                        "${CMAKE_CURRENT_BINARY_DIR}/version.r")
+set(app_license "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(license_resource "${CMAKE_CURRENT_BINARY_DIR}/license.r")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${app_license}")
+file(READ "${app_license}" license_data HEX)
+file(WRITE "${license_resource}" "data 'TEXT' (129, \"MIT License\") { $\"${license_data}\" };\n")
+list(APPEND linewren_resources "${license_resource}")
 if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
     set(LINEWREN_OSX_ICONS tiger CACHE STRING "Icon artwork for the Carbon build")
     set_property(CACHE LINEWREN_OSX_ICONS PROPERTY STRINGS tiger leopard)

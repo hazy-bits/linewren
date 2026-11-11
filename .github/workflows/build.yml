@@ -76,9 +76,9 @@ jobs:
           VERSION: ${{ needs.powerpc.outputs.version }}
         run: |
           tag="$GITHUB_REF_NAME"
-          if ! release=$(gh release view "$tag" --json isDraft,assets); then
+          if ! release=$(gh release view "$tag" --json isDraft); then
             gh release create "$tag" --draft --verify-tag --generate-notes --title "Linewren $VERSION"
-            release=$(gh release view "$tag" --json isDraft,assets)
+            release=$(gh release view "$tag" --json isDraft)
           fi
           if [[ $(jq -r '.isDraft' <<< "$release") != true ]]; then
             echo "Release $tag is already published."
@@ -87,7 +87,5 @@ jobs:
           for asset in "Linewren-$VERSION-Mac-OS-9.zip" \
                        "Linewren-$VERSION-PowerPC-Tiger.dmg" \
                        "Linewren-$VERSION-PowerPC-Leopard.dmg"; do
-            if ! jq -e --arg name "$asset" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
-              gh release upload "$tag" "release/$asset"
-            fi
+            gh release upload "$tag" "release/$asset" --clobber
           done

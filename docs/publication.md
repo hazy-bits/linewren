@@ -19,8 +19,8 @@
   GitHub Actions checks the tag, builds all three archives with the release
   version, and attaches them to a draft GitHub release. Review the release
   notes and test the archives on the target systems before publishing the draft.
-- Confirm the app license before the first public release. To build the same
-  archives locally on macOS, run the packaging script from the repository root.
+- To build the same archives locally on macOS, run the packaging script from
+  the repository root.
 
   ```sh
   ./scripts/package-release.sh release

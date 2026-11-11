@@ -57,6 +57,7 @@
             distribution = pkgs.runCommand "Linewren-${version}-Mac-OS-9" { nativeBuildInputs = [ pkgs.zip ]; } ''
               mkdir -p "$out/Linewren/Fonts"
               cp ${powerpc}/Linewren.bin "$out/Linewren/"
+              cp ${./LICENSE} "$out/Linewren/LICENSE.txt"
               cp ${./fonts}/* "$out/Linewren/Fonts/"
               cd "$out"
               zip -qr ${pkgs.lib.escapeShellArg classicArchive} Linewren
