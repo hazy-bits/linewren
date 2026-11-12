@@ -1,10 +1,6 @@
 #include "mac-toolbox.h"
 #include "editor.h"
 #include "settings.h"
-#include "bundled-fonts.h"
-#ifdef LINEWREN_FONT_SPECIMENS
-#include "font-specimens.h"
-#endif
 #include "workspace.h"
 #if TARGET_API_MAC_CARBON
 #include <CarbonEvents.h>
@@ -191,15 +187,12 @@ static Boolean InitTypographyMenus(void)
     if(gFontMenu == NULL || gSizeMenu == NULL)
         return false;
 
-    BundledFontsActivate();
     AppendResMenu(gFontMenu, 'FOND');
     static const ConstStr255Param favorites[] = {
         "\pVerdana", "\pGeneva", "\pChicago", "\pCharcoal", "\pArial", "\pHelvetica",
         "\pGeorgia", "\pNew York", "\pTimes", "\pMonaco", "\pCourier"
     };
     short featured = 0;
-    for(unsigned i = 0; i < kBundledFontCount; ++i)
-        featured = FeatureFont(kBundledFontNames[i], featured);
     for(unsigned i = 0; i < sizeof(favorites) / sizeof(*favorites); ++i)
         featured = FeatureFont(favorites[i], featured);
     if(featured != 0 && featured < CountMenuItems(gFontMenu))
@@ -1819,20 +1812,19 @@ static const char *SmokeEditorInput(WindowRef window, Editor *editor)
 
 static const char *SmokeTypographyMenus(Editor *editor)
 {
+    if(gTypography.family != EditorDefaultTypography().family ||
+       !EditorTypographyMatches(editor, gTypography))
+        return "FAIL: unavailable saved font did not fall back to the default";
     for(short item = 1, count = CountMenuItems(gFontMenu); item <= count; ++item) {
         short mark;
         GetItemMark(gFontMenu, item, &mark);
         if((mark != 0) != (item == gFontItem))
             return "FAIL: the Font menu did not mark exactly the active font";
     }
-    for(unsigned i = 0; i < kBundledFontCount; ++i) {
-        if(FindFontItem(kBundledFontNames[i]) == 0)
-            return "FAIL: bundled font families missing from the menu";
-    }
     EditorTypography initial = gTypography;
     short originalItem = gFontItem;
     short alternate = FindFontItem("\pGeneva");
-    if(alternate == originalItem)
+    if(alternate == 0 || alternate == originalItem)
         alternate = FindFontItem("\pMonaco");
     if(originalItem == 0 || alternate == 0 || alternate == originalItem)
         return "FAIL: installed font families missing from the menu";
@@ -1857,14 +1849,6 @@ static const char *SmokeTypographyMenus(Editor *editor)
     key.message = '+';
     DispatchEvent(&key);
     selected &= gTypography.points == 24 && EditorTypographyMatches(editor, gTypography);
-    for(unsigned i = 0; i < kBundledFontCount; ++i) {
-        short item = FindFontItem(kBundledFontNames[i]);
-        short family;
-        GetFNum(kBundledFontNames[i], &family);
-        DoMenuCommand(((long)kFontMenu << 16) | item);
-        selected &= family != 0 && gFontItem == item && gTypography.family == family &&
-                    EditorTypographyMatches(editor, gTypography);
-    }
 
     Handle after;
     Boolean sameText = EditorEncodeText(editor, &after) == noErr;
@@ -2411,15 +2395,7 @@ static const char *SmokeTest(WindowRef window)
 }
 #endif
 
-#ifdef LINEWREN_FONT_SPECIMENS
-static void DrawFontSpecimen(WindowRef window, unsigned theme)
-{
-    DoMenuCommand(((long)kViewMenu << 16) | (theme == 0 ? kLightTheme : kDarkTheme));
-    DrawDocument(window);
-}
-#endif
-
-#if !defined(LINEWREN_SMOKE_TEST) && !defined(LINEWREN_FONT_SPECIMENS)
+#ifndef LINEWREN_SMOKE_TEST
 static void RestoreDrafts(WindowRef first)
 {
     short index = 0;
@@ -2489,8 +2465,11 @@ int main(void)
         EditorShutdown();
         editorReady = false;
     }
-    if(editorReady)
+    if(editorReady) {
+        static const Str63 unavailableFont = "\pUnavailable Linewren Test Font";
+        memcpy(gSettings.font, unavailableFont, sizeof(unavailableFont));
         ApplySettings();
+    }
     smokeResult = editorReady ? SmokeTest(NewDocument(&windowStatus)) : "FAIL: text engine initialization";
     gRunning = false;
 #else
@@ -2501,19 +2480,6 @@ int main(void)
         return 1;
     }
     ApplySettings();
-#ifdef LINEWREN_FONT_SPECIMENS
-    short right = MainScreenBounds().right - 10;
-    short bottom = MainScreenBounds().bottom - 10;
-    SetRect(&gNextWindowRect, 12, 48, right < 630 ? right : 630, bottom < 448 ? bottom : 448);
-    WindowRef specimen = NewDocument(NULL);
-    int specimenResult = specimen == NULL ? 1 :
-        FontSpecimensRun(specimen, GetDocument(specimen), DrawFontSpecimen);
-    if(specimen != NULL)
-        CloseDocument(specimen);
-    EditorShutdown();
-    BundledFontsDeactivate();
-    return specimenResult;
-#else
     WindowRef first = NewDocument(NULL);
     if(first == NULL)
         gRunning = false;
@@ -2521,7 +2487,6 @@ int main(void)
         RestoreDrafts(first);
         StartWheelInput();
     }
-#endif
 #endif
 
     while(gRunning) {
@@ -2573,7 +2538,6 @@ int main(void)
 #ifdef LINEWREN_SMOKE_TEST
     if(editorReady)
         EditorShutdown();
-    BundledFontsDeactivate();
     ClassicTestReport report;
     if(!ClassicTestBegin(&report, 1))
         return 1;
@@ -2600,7 +2564,6 @@ int main(void)
         ISpShutdown();
 #endif
     EditorShutdown();
-    BundledFontsDeactivate();
 #endif
     return 0;
 }

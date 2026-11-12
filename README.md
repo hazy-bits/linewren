@@ -74,5 +74,4 @@ Linewren is available under the [MIT License](LICENSE).
 
 [MD4C](vendor/md4c/LICENSE.md) and the
 [Classic Mac App Template](https://github.com/hazy-bits/classic-mac-app-template/blob/main/LICENSE)
-use the MIT License. [Bundled fonts](fonts/README.md) include their SIL Open
-Font License files.
+use the MIT License.

@@ -66,18 +66,3 @@ with UTM's default shortcut.
 Set `CLASSIC_MAC_GUEST` to omit the IP from repeated commands.
 
 For the editor and its smoke suite, see [Text engine](text-engines.md).
-
-## Capture the optional font specimens
-
-This target activates temporary copies of the bundled suitcases in the guest.
-It checks the four faces and native font discovery, renders the same Markdown
-at 12, 13, and 14 pt in both themes, and returns six unscaled 13 pt captures of
-Linewren's content area. It removes the temporary suitcases before exiting.
-
-```sh
-nix build .#powerpc-font-specimens --out-link result-font-specimens
-tools=$(nix build .#retro68-tools --no-link --print-out-paths)
-"$tools/bin/LaunchAPPL" -t 70 -e tcp --tcp-address 192.168.64.5 \
-  result-font-specimens/Linewren.bin > /tmp/linewren-font-specimens.ppm
-python3 scripts/unpack-font-specimens.py /tmp/linewren-font-specimens.ppm /tmp/linewren-font-specimens
-```

@@ -23,7 +23,7 @@ nix build .#powerpc --out-link result --option fallback false
 Copy the actual file `result/Linewren.bin`. If Nix plans to compile
 Retro68, see [Nix cache setup](nix-cache.md).
 
-## Distribution with bundled fonts
+## Release archive
 
 Build the ready-to-transfer archive on the host.
 
@@ -31,8 +31,6 @@ Build the ready-to-transfer archive on the host.
 nix build .#distribution --out-link result-distribution
 ```
 
-Extract `result-distribution/Linewren-Mac-OS-9.zip` on the host, transfer
-`Linewren.bin` to the classic Mac, and decode it with StuffIt Expander. Linewren
-loads the bundled fonts at startup. The separate suitcases in the ZIP are
-for system-wide installation. See the [font installation notes](../fonts/README.md)
-for the suitcase names and upstream licenses.
+Extract the ZIP in `result-distribution/` on the host, transfer
+`Linewren.bin` to the classic Mac, and decode it with StuffIt Expander.
+The Font menu uses the fonts installed on the Mac.

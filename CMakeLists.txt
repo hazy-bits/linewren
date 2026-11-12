@@ -26,7 +26,6 @@ endif()
 set(editor_source src/editor-atsui.c src/document.c src/markdown.c src/markdown-presentation.c
                   src/text-files.c src/settings.c src/workspace.c vendor/md4c/md4c.c)
 
-option(LINEWREN_FONT_SPECIMENS "Capture the bundled fonts in a running ATSUI editor" OFF)
 set(linewren_resources src/Linewren.r assets/icons/bundle.r assets/icons/classic.r
                        "${CMAKE_CURRENT_BINARY_DIR}/version.r")
 set(app_license "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
@@ -53,29 +52,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
     endforeach()
     list(APPEND linewren_resources "${icon_resources}")
 endif()
-if(LINEWREN_FONT_SPECIMENS)
-    if(LINEWREN_SMOKE_TEST)
-        message(FATAL_ERROR "Font specimens require the interactive ATSUI backend")
-    endif()
-    list(APPEND editor_source src/font-specimens.c)
-endif()
-list(APPEND editor_source src/bundled-fonts.c)
-set(font_resources "${CMAKE_CURRENT_BINARY_DIR}/bundled-fonts.r")
-file(WRITE "${font_resources}" "")
-set(resource_id 200)
-foreach(family "Atkinson Hyperlegible" "Linewren Humanist" "Linewren Grotesk")
-    set(suitcase_path "${CMAKE_CURRENT_SOURCE_DIR}/fonts/${family}.bin")
-    set(license_path "${CMAKE_CURRENT_SOURCE_DIR}/fonts/${family}-OFL.txt")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-                 "${suitcase_path}" "${license_path}")
-    file(READ "${suitcase_path}" suitcase HEX)
-    file(READ "${license_path}" license HEX)
-    file(APPEND "${font_resources}" "data 'LwFt' (${resource_id}) { $\"${suitcase}\" };\n"
-                "data 'LwFL' (${resource_id}, \"${family} OFL\") { $\"${license}\" };\n")
-    math(EXPR resource_id "${resource_id} + 1")
-endforeach()
-list(APPEND linewren_resources "${font_resources}")
-
 add_application(Linewren
     src/main.c
     ${editor_source}
@@ -92,10 +68,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
 else()
     target_link_libraries(Linewren PRIVATE NavigationLib InputSprocketLib ATSUnicodeLib
                                         UnicodeConverter FontManager InternetConfigLib)
-endif()
-
-if(LINEWREN_FONT_SPECIMENS)
-    target_compile_definitions(Linewren PRIVATE LINEWREN_FONT_SPECIMENS)
 endif()
 
 set_target_properties(Linewren PROPERTIES COMPILE_OPTIONS -ffunction-sections)

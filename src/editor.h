@@ -78,9 +78,6 @@ typedef struct {
 EditorTypography EditorDefaultTypography(void);
 Boolean EditorFontAvailable(short family);
 Boolean EditorSetTypography(Editor *editor, EditorTypography typography);
-#ifdef LINEWREN_FONT_SPECIMENS
-OSStatus EditorSpecimenLayoutStatus(Editor *editor);
-#endif
 
 /* The editor owns text after a successful call. */
 OSStatus EditorTakeText(Editor *editor, Handle text);

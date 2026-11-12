@@ -51,14 +51,12 @@
             powerpc-osx = build "carbon" "-osx" [ ];
             powerpc-osx-leopard = build "carbon" "-osx-leopard" [ "-DLINEWREN_OSX_ICONS=leopard" ];
             powerpc-osx-smoke = build "carbon" "-osx-smoke" [ "-DLINEWREN_SMOKE_TEST=ON" ];
-            powerpc-font-specimens = build "powerpc" "-font-specimens" [ "-DLINEWREN_FONT_SPECIMENS=ON" ];
             retro68-tools = tools;
             inherit (inputs'.classicMacApp.packages) classic-runner;
             distribution = pkgs.runCommand "Linewren-${version}-Mac-OS-9" { nativeBuildInputs = [ pkgs.zip ]; } ''
-              mkdir -p "$out/Linewren/Fonts"
+              mkdir -p "$out/Linewren"
               cp ${powerpc}/Linewren.bin "$out/Linewren/"
               cp ${./LICENSE} "$out/Linewren/LICENSE.txt"
-              cp ${./fonts}/* "$out/Linewren/Fonts/"
               cd "$out"
               zip -qr ${pkgs.lib.escapeShellArg classicArchive} Linewren
             '';

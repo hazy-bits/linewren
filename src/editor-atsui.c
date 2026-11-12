@@ -1052,13 +1052,6 @@ void EditorDraw(Editor *editor)
     }
 }
 
-#ifdef LINEWREN_FONT_SPECIMENS
-OSStatus EditorSpecimenLayoutStatus(Editor *editor)
-{
-    return editor->layoutError;
-}
-#endif
-
 void EditorResize(Editor *editor, const Rect *view, const Rect *outline)
 {
     unsigned offset = SourceOffset(editor, editor->top);
