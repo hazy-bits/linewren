@@ -25,7 +25,7 @@ a:focus-visible { outline: 2px solid currentColor; outline-offset: 4px; }
 .intro { margin-bottom: 2rem; }
 .intro p { margin-top: .75rem; }
 nav { display: flex; flex-wrap: wrap; gap: .4rem 1.25rem; }
-figure { margin: 0; }
+figure { margin: 0; max-width: 662px; }
 figure a { display: block; }
 figure img { display: block; max-width: 100%; height: auto; }
 figcaption {

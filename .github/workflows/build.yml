@@ -4,7 +4,32 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # GitHub evaluates these paths for branches. Release tags and manual runs still build.
+    paths:
+      - 'src/**'
+      - 'vendor/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'assets/icons/**'
+      - 'CMakeLists.txt'
+      - 'classic-project.json'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'LICENSE'
+      - 'VERSION'
   pull_request:
+    paths:
+      - 'src/**'
+      - 'vendor/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'assets/icons/**'
+      - 'CMakeLists.txt'
+      - 'classic-project.json'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'LICENSE'
+      - 'VERSION'
   workflow_dispatch:
 
 permissions:
