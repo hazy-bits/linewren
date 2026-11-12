@@ -28,7 +28,12 @@ nav { display: flex; flex-wrap: wrap; gap: .4rem 1.25rem; }
 figure { margin: 0; }
 figure a { display: block; }
 figure img { display: block; max-width: 100%; height: auto; }
-figcaption { margin-top: .45rem; color: #595d56; font-size: .84rem; }
+figcaption {
+  margin-top: .45rem;
+  color: #595d56;
+  font: .84rem/1.4 Verdana, Geneva, sans-serif;
+  letter-spacing: .03em;
+}
 section { margin: clamp(2rem, 5vw, 3rem) 0; }
 dl { margin: 0; }
 dt { font-weight: 700; }
