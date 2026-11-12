@@ -4,7 +4,9 @@ A quiet Markdown and plain-text editor for PowerPC Macs. Linewren pairs a classi
 Mac interface with live Markdown styling, a centered writing column, and
 folders of ordinary UTF-8 files.
 
-![Linewren in light mode on Mac OS 9](site/assets/linewren-light.png)
+<a href="site/assets/linewren-light.png?raw=true"><img src="site/assets/linewren-light.png" width="662" alt="Linewren in light mode on Mac OS 9"></a>
+
+[View the original 1324 × 699 screenshot](site/assets/linewren-light.png?raw=true)
 
 ## Get Linewren
 
