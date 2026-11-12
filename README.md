@@ -1,4 +1,4 @@
-<h1><img src="site/assets/linewren-icon.png" alt="" width="96" height="96" align="middle"> Linewren</h1>
+<h1><img src="site/assets/linewren-icon.png" alt="" width="96" height="96" align="absmiddle"> Linewren</h1>
 
 A quiet Markdown and plain-text editor for PowerPC Macs. Linewren pairs a classic
 Mac interface with live Markdown styling, a centered writing column, and
