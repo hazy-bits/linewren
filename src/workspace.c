@@ -326,8 +326,10 @@ void WorkspaceRefreshSidebar(Workspace *workspace, WindowRef window)
     InvalidateSidebar(window);
 }
 
-static OSErr AddFolder(Workspace *workspace, WindowRef window, short volume, long directory)
+OSErr WorkspaceAttachFolder(Workspace *workspace, WindowRef window, short volume, long directory)
 {
+    if(directory == 0)
+        return fnfErr;
     volume = VolumeReference(volume);
     SidebarFolder *folder = FindSidebarFolder(workspace->roots, volume, directory);
     if(folder == NULL) {
@@ -348,6 +350,19 @@ static OSErr AddFolder(Workspace *workspace, WindowRef window, short volume, lon
     folder->expanded = true;
     WorkspaceRefreshSidebar(workspace, window);
     return noErr;
+}
+
+OSErr WorkspaceLocateFolder(const FSSpec *file, long *directory)
+{
+    if(file->name[0] == 0) {
+        *directory = file->parID;
+        return noErr;
+    }
+    CInfoPBRec info;
+    OSErr error = ReadFileCatalog(file, &info);
+    if(error == noErr)
+        *directory = (info.hFileInfo.ioFlAttrib & kioFlAttribDirMask) ? info.dirInfo.ioDrDirID : 0;
+    return error;
 }
 
 static OSErr ToggleFolder(Workspace *workspace, const SidebarEntry *entry)
@@ -393,17 +408,10 @@ void WorkspaceChooseFolder(Workspace *workspace, WindowRef window)
         error = AEGetNthPtr(&reply.selection, 1, typeFSS, &keyword, &type,
                            &folder, sizeof(folder), &length);
         if(error == noErr) {
-            long directory = folder.parID;
-            if(folder.name[0] != 0) {
-                CInfoPBRec info = {0};
-                info.dirInfo.ioNamePtr = folder.name;
-                info.dirInfo.ioVRefNum = folder.vRefNum;
-                info.dirInfo.ioDrDirID = folder.parID;
-                error = PBGetCatInfoSync(&info);
-                directory = info.dirInfo.ioDrDirID;
-            }
+            long directory;
+            error = WorkspaceLocateFolder(&folder, &directory);
             if(error == noErr)
-                error = AddFolder(workspace, window, folder.vRefNum, directory);
+                error = WorkspaceAttachFolder(workspace, window, folder.vRefNum, directory);
         }
     }
     if(reply.validRecord)
@@ -416,12 +424,9 @@ void WorkspaceRestoreFolders(Workspace *workspace, WindowRef window,
                              const FSSpec *folders, unsigned count)
 {
     for(unsigned i = count; i-- != 0;) {
-        CInfoPBRec info = {0};
-        info.dirInfo.ioNamePtr = (StringPtr)folders[i].name;
-        info.dirInfo.ioVRefNum = folders[i].vRefNum;
-        info.dirInfo.ioDrDirID = folders[i].parID;
-        if(PBGetCatInfoSync(&info) == noErr)
-            AddFolder(workspace, window, folders[i].vRefNum, info.dirInfo.ioDrDirID);
+        long directory;
+        if(WorkspaceLocateFolder(&folders[i], &directory) == noErr)
+            WorkspaceAttachFolder(workspace, window, folders[i].vRefNum, directory);
     }
 }
 
@@ -941,6 +946,11 @@ Boolean WorkspaceHasFile(Workspace *workspace, const FSSpec *file)
             workspace->file.vRefNum == VolumeReference(file->vRefNum));
 }
 
+const FSSpec *WorkspaceCurrentFile(const Workspace *workspace)
+{
+    return workspace->diskBytes != NULL ? &workspace->file : NULL;
+}
+
 #ifdef LINEWREN_SMOKE_TEST
 static short gRecoveryTestVolume;
 static long gRecoveryTestDirectory;
@@ -1114,7 +1124,7 @@ static OSErr LoadDocument(Editor *editor, WindowRef window, const FSSpec *file,
     workspace->pending = false;
     SetWTitle(window, file->name);
     if(workspace->roots == NULL)
-        AddFolder(workspace, window, file->vRefNum, file->parID);
+        WorkspaceAttachFolder(workspace, window, file->vRefNum, file->parID);
     else
         InvalidateSidebar(window);
     Status(workspace, window, "\pSaved");
@@ -1184,7 +1194,7 @@ static OSErr SaveTo(Editor *editor, WindowRef window, const FSSpec *file, Boolea
     SetWTitle(window, file->name);
     if(newFile) {
         if(workspace->roots == NULL)
-            AddFolder(workspace, window, file->vRefNum, file->parID);
+            WorkspaceAttachFolder(workspace, window, file->vRefNum, file->parID);
         else
             WorkspaceRefreshSidebar(workspace, window);
     }
@@ -1675,8 +1685,8 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     nestedCreated = true;
 
     result = "FAIL: workspace roots or nested folders were missing from the sidebar";
-    if(AddFolder(workspace, window, first.vRefNum, firstID) != noErr ||
-       AddFolder(workspace, window, second.vRefNum, secondID) != noErr ||
+    if(WorkspaceAttachFolder(workspace, window, first.vRefNum, firstID) != noErr ||
+       WorkspaceAttachFolder(workspace, window, second.vRefNum, secondID) != noErr ||
        workspace->rowCount < 4 || workspace->rows[0].directory != secondID ||
        workspace->rows[1].kind != kSeparator || workspace->rows[2].directory != firstID ||
        workspace->rows[3].directory != nestedID || workspace->rows[3].depth != 1)

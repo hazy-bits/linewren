@@ -19,6 +19,9 @@ void WorkspaceRefreshSidebar(Workspace *workspace, WindowRef window);
 Boolean WorkspaceClick(Editor *editor, WindowRef window, Point point, Boolean contextual,
                        FSSpec *openFile);
 void WorkspaceChooseFolder(Workspace *workspace, WindowRef window);
+/* On success a file has directory ID zero. */
+OSErr WorkspaceLocateFolder(const FSSpec *file, long *directory);
+OSErr WorkspaceAttachFolder(Workspace *workspace, WindowRef window, short volume, long directory);
 void WorkspaceRestoreFolders(Workspace *workspace, WindowRef window,
                              const FSSpec *folders, unsigned count);
 unsigned WorkspaceCopyFolders(Workspace *workspace, FSSpec *folders, unsigned capacity);
@@ -27,6 +30,7 @@ unsigned WorkspaceSearch(Workspace *workspace, ConstStr255Param query,
 OSErr WorkspaceOpen(Editor *editor, WindowRef window, const FSSpec *file);
 void WorkspaceOpenError(Workspace *workspace, WindowRef window, OSErr error);
 Boolean WorkspaceHasFile(Workspace *workspace, const FSSpec *file);
+const FSSpec *WorkspaceCurrentFile(const Workspace *workspace);
 void WorkspaceEdited(Workspace *workspace);
 void WorkspaceIdle(Editor *editor, WindowRef window);
 Boolean WorkspaceNextRecovery(short *index, FSSpec *file);

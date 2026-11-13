@@ -904,24 +904,46 @@ void EditorScrollLines(Editor *editor, short lines)
     ScrollTo(editor, MoveLines(editor, editor->top, lines));
 }
 
+static void SelectionRange(const Editor *editor, unsigned *start, unsigned *end)
+{
+    *start = editor->anchor < editor->caret ? editor->anchor : editor->caret;
+    *end = editor->anchor > editor->caret ? editor->anchor : editor->caret;
+}
+
+static Boolean SelectionRowRegion(Editor *editor, LayoutSpan *span, Position row,
+                                  Fixed x, short baseline)
+{
+    unsigned low, high;
+    SelectionRange(editor, &low, &high);
+    unsigned first = row.start + LineOffset(span, row.line);
+    unsigned last = span->length != 0 ? row.start + span->breaks[row.line] : first;
+    if(low >= last || high <= first || first == last)
+        return false;
+    unsigned left = low > first ? low : first;
+    unsigned right = high < last ? high : last;
+    return ATSUGetTextHighlight(span->layout, x, (Fixed)baseline << 16,
+                                left - row.start, right - left, editor->highlight) == noErr;
+}
+
+static Rect CaretBounds(Editor *editor, LayoutSpan *span, Position row, unsigned offset,
+                        Fixed x, short baseline)
+{
+    Fixed dx = CaretX(span, row.line, offset - row.start);
+    short h = (short)((x + dx + 0x8000) >> 16);
+    return (Rect){baseline - editor->typography.points, h, baseline + kCaretDescent + 1, h + 2};
+}
+
 static void PaintSelection(Editor *editor, LayoutSpan *span, Position row, Fixed x, short baseline)
 {
     unsigned start = LineOffset(span, row.line);
     unsigned end = span->length != 0 ? span->breaks[row.line] : start;
     if(editor->anchor != editor->caret) {
-        unsigned low = editor->anchor < editor->caret ? editor->anchor : editor->caret;
-        unsigned high = editor->anchor > editor->caret ? editor->anchor : editor->caret;
-        if(low < row.start + end && high > row.start + start) {
-            unsigned left = low > row.start + start ? low - row.start : start;
-            unsigned right = high < row.start + end ? high - row.start : end;
-            if(ATSUGetTextHighlight(span->layout, x, (Fixed)baseline << 16,
-                                   left, right - left, editor->highlight) == noErr) {
-                RGBColor highlight = editor->theme->page.red < 0x8000
-                    ? (RGBColor){0x2d2d, 0x4545, 0x6262}
-                    : (RGBColor){0xc5c5, 0xdcdc, 0xf5f5};
-                RGBForeColor(&highlight);
-                PaintRgn(editor->highlight);
-            }
+        if(SelectionRowRegion(editor, span, row, x, baseline)) {
+            RGBColor highlight = editor->theme->page.red < 0x8000
+                ? (RGBColor){0x2d2d, 0x4545, 0x6262}
+                : (RGBColor){0xc5c5, 0xdcdc, 0xf5f5};
+            RGBForeColor(&highlight);
+            PaintRgn(editor->highlight);
         }
     } else if(editor->caret >= row.start + start && editor->caret <= row.start + end) {
         const UniChar *source = Source(editor);
@@ -930,9 +952,7 @@ static void PaintSelection(Editor *editor, LayoutSpan *span, Position row, Fixed
         if((editor->caret == first && editor->trailing && first != 0 && source[first - 1] != '\r') ||
            (editor->caret == last && !editor->trailing && last < editor->length && source[last] != '\r'))
             return;
-        Fixed dx = CaretX(span, row.line, editor->caret - row.start);
-        short h = (short)((x + dx + 0x8000) >> 16);
-        Rect caret = {baseline - editor->typography.points, h, baseline + kCaretDescent + 1, h + 2};
+        Rect caret = CaretBounds(editor, span, row, editor->caret, x, baseline);
         RGBForeColor(&editor->theme->caret);
         PaintRect(&caret);
     }
@@ -1220,26 +1240,81 @@ void EditorJumpToHeading(Editor *editor, unsigned index)
     }
 }
 
-static unsigned HitPoint(Editor *editor, Point point, Position *row, Boolean *trailing)
+static Boolean RowAtPoint(Editor *editor, Point point, Position *row, short *top)
 {
-    short top = editor->view.top;
+    *top = editor->view.top;
     *row = editor->top;
-    short bottom = top + MetricsAt(editor, *row).height;
+    short bottom = *top + MetricsAt(editor, *row).height;
     while(point.v >= bottom) {
         Position next = *row;
-        if(!Step(editor, &next, true)) {
-            *trailing = false;
-            row->start = editor->length;
-            row->line = 0;
-            return editor->length;
-        }
+        if(!Step(editor, &next, true))
+            return false;
         short nextBottom = bottom + MetricsAt(editor, next).height;
         if(nextBottom > editor->view.bottom)
             break;
         *row = next;
+        *top = bottom;
         bottom = nextBottom;
     }
+    return true;
+}
+
+static unsigned HitPoint(Editor *editor, Point point, Position *row, Boolean *trailing)
+{
+    short top;
+    if(!RowAtPoint(editor, point, row, &top)) {
+        *trailing = false;
+        *row = (Position){editor->length, 0};
+        return editor->length;
+    }
     return HitLine(editor, *row, (Fixed)(point.h - TextBounds(editor).left) * 65536, trailing);
+}
+
+RgnHandle EditorTextDragRegion(Editor *editor, Point point)
+{
+    Rect text = TextBounds(editor);
+    if(editor->anchor == editor->caret || !PtInRect(point, &text))
+        return NULL;
+    RgnHandle region = NewRgn();
+    if(region == NULL)
+        return NULL;
+    Fixed x = (Fixed)text.left << 16;
+    Position row = editor->top;
+    short top = text.top;
+    do {
+        LayoutSpan *span = Layout(editor, row.start);
+        if(span == NULL)
+            break;
+        RowMetrics metrics = editor->metrics[span->heading];
+        if(top != text.top && top + metrics.height > text.bottom)
+            break;
+        if(SelectionRowRegion(editor, span, row, x, top + metrics.baseline))
+            UnionRgn(region, editor->highlight, region);
+        top += metrics.height;
+    } while(Step(editor, &row, true));
+    RectRgn(editor->highlight, &text);
+    SectRgn(region, editor->highlight, region);
+    if(!PtInRgn(point, region)) {
+        DisposeRgn(region);
+        return NULL;
+    }
+    CopyRgn(region, editor->highlight);
+    InsetRgn(editor->highlight, 1, 1);
+    DiffRgn(region, editor->highlight, region);
+    return region;
+}
+
+Handle EditorCopySelectedText(Editor *editor)
+{
+    unsigned start, end;
+    SelectionRange(editor, &start, &end);
+    if(start == end)
+        return NULL;
+    Size bytes = (end - start) * sizeof(UniChar);
+    Handle text = NewHandle(bytes);
+    if(text != NULL)
+        memcpy(*text, Source(editor) + start, bytes);
+    return text;
 }
 
 static unsigned CursorStepBy(Editor *editor, unsigned offset, Boolean forward,
@@ -1347,12 +1422,6 @@ void EditorClick(Editor *editor, const EventRecord *event)
         Delay(1, &now);
     }
     editor->trackingSelection = false;
-}
-
-static void SelectionRange(const Editor *editor, unsigned *start, unsigned *end)
-{
-    *start = editor->anchor < editor->caret ? editor->anchor : editor->caret;
-    *end = editor->anchor > editor->caret ? editor->anchor : editor->caret;
 }
 
 static unsigned CursorStepBy(Editor *editor, unsigned offset, Boolean forward,
@@ -2042,45 +2111,128 @@ static Boolean CopySelection(Editor *editor, unsigned start, unsigned end)
     return true;
 }
 
+static Boolean InsertTransferText(Editor *editor, unsigned start, unsigned end, Handle data,
+                                  long bytes, OSType flavor)
+{
+    if(bytes <= 0 || bytes > 2 * kTextFileLimit)
+        return false;
+    Handle text = data;
+    if(flavor == 'utf8') {
+        if(bytes > kTextFileLimit || DecodeTextFile(data, &text) != noErr)
+            return false;
+        bytes = GetHandleSize(text);
+    } else if(flavor == 'TEXT') {
+        if(bytes > kTextFileLimit)
+            return false;
+        text = NewHandle(bytes * sizeof(UniChar));
+        if(text == NULL)
+            return false;
+        HLock(data);
+        HLock(text);
+        ByteCount converted;
+        bytes = FromRoman(*data, bytes, (UniChar *)*text, &converted) == noErr ? converted : 0;
+        HUnlock(data);
+    }
+
+    Boolean inserted = false;
+    if(bytes > 0 && bytes % sizeof(UniChar) == 0) {
+        HLock(text);
+        UniChar *chars = (UniChar *)*text;
+        unsigned length = bytes / sizeof(*chars), used = 0;
+        for(unsigned i = chars[0] == 0xfeff ? 1 : 0; i < length; ++i) {
+            UniChar ch = chars[i];
+            if(ch == '\r' && i + 1 < length && chars[i + 1] == '\n')
+                ++i;
+            chars[used++] = ch == '\n' ? '\r' : ch;
+        }
+        inserted = used != 0 && ReplaceRange(editor, start, end, chars, used, start + used, true);
+        HUnlock(text);
+    }
+    if(text != data)
+        DisposeHandle(text);
+    return inserted;
+}
+
 static void Paste(Editor *editor, unsigned start, unsigned end)
 {
-    Handle text = NewHandle(0), roman = NULL;
-    if(text == NULL)
+    Handle data = NewHandle(0);
+    if(data == NULL)
         return;
-    long bytes = ReadScrap(text, 'utxt');
+    long bytes = ReadScrap(data, 'utxt');
+    OSType flavor = 'utxt';
     if(bytes <= 0) {
-        roman = text;
-        text = NULL;
-        bytes = ReadScrap(roman, 'TEXT');
-        if(bytes > 0 && bytes <= kTextFileLimit) {
-            text = NewHandle(bytes * sizeof(UniChar));
-            if(text != NULL) {
-                HLock(roman);
-                HLock(text);
-                ByteCount converted;
-                if(FromRoman(*roman, bytes, (UniChar *)*text, &converted) == noErr)
-                    bytes = converted;
-                else
-                    bytes = 0;
-            }
-        }
-        DisposeHandle(roman);
+        flavor = 'TEXT';
+        bytes = ReadScrap(data, flavor);
     }
-    if(text != NULL) {
-        if(bytes > 0 && bytes <= 2 * kTextFileLimit && bytes % sizeof(UniChar) == 0) {
-            HLock(text);
-            UniChar *chars = (UniChar *)*text;
-            unsigned length = bytes / sizeof(*chars), used = 0;
-            for(unsigned i = chars[0] == 0xfeff ? 1 : 0; i < length; ++i) {
-                UniChar ch = chars[i];
-                if(ch == '\r' && i + 1 < length && chars[i + 1] == '\n')
-                    ++i;
-                chars[used++] = ch == '\n' ? '\r' : ch;
-            }
-            ReplaceRange(editor, start, end, chars, used, start + used, true);
-        }
-        DisposeHandle(text);
+    InsertTransferText(editor, start, end, data, bytes, flavor);
+    DisposeHandle(data);
+}
+
+Boolean EditorDropText(Editor *editor, Point point, Handle data, OSType flavor)
+{
+    Position row;
+    Boolean trailing;
+    unsigned offset = HitPoint(editor, point, &row, &trailing);
+    return InsertTransferText(editor, offset, offset, data, GetHandleSize(data), flavor);
+}
+
+Rect EditorTextDropCaret(Editor *editor, Point point, Boolean copy)
+{
+    Position row;
+    short top;
+    Boolean withinRows = RowAtPoint(editor, point, &row, &top);
+    Fixed x = (Fixed)TextBounds(editor).left << 16;
+    Boolean trailing;
+    unsigned offset = withinRows ? HitLine(editor, row, (Fixed)point.h * 65536 - x, &trailing)
+                                 : editor->length;
+    unsigned start, end;
+    SelectionRange(editor, &start, &end);
+    if(!copy && offset >= start && offset <= end)
+        return (Rect){0};
+    LayoutSpan *span = Layout(editor, row.start);
+    if(span == NULL)
+        return (Rect){0};
+    Rect caret = CaretBounds(editor, span, row, offset, x, top + editor->metrics[span->heading].baseline);
+    Rect view = TextBounds(editor), visible;
+    return SectRect(&caret, &view, &visible) ? visible : (Rect){0};
+}
+
+Boolean EditorDropSelection(Editor *editor, Point point, Boolean copy)
+{
+    unsigned start, end;
+    SelectionRange(editor, &start, &end);
+    if(start == end)
+        return false;
+    Position row;
+    Boolean trailing;
+    unsigned drop = HitPoint(editor, point, &row, &trailing);
+    unsigned length = end - start;
+    if(!copy && drop >= start && drop <= end)
+        return false;
+
+    /* Rotate the affected span in one edit so Undo restores both text and selection. */
+    unsigned first = copy || drop < start ? drop : start;
+    unsigned last = copy || drop > end ? drop : end;
+    unsigned inserted = copy ? length : last - first;
+    UniChar *replacement = malloc(inserted * sizeof(*replacement));
+    if(replacement == NULL)
+        return false;
+    const UniChar *text = Source(editor);
+    unsigned selected = !copy && drop > end ? drop - length : drop;
+    memcpy(replacement + selected - first, text + start, length * sizeof(*text));
+    if(!copy) {
+        if(drop < start)
+            memcpy(replacement + length, text + drop, (start - drop) * sizeof(*text));
+        else
+            memcpy(replacement, text + end, (drop - end) * sizeof(*text));
     }
+    Boolean applied = ReplaceRange(editor, first, last, replacement, inserted, selected + length, true);
+    free(replacement);
+    if(applied) {
+        editor->anchor = selected;
+        editor->clickCount = 0;
+    }
+    return applied;
 }
 
 Boolean EditorCanUndo(Editor *editor) { return editor->undo.count != 0; }

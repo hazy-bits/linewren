@@ -3,9 +3,10 @@
 #include <Aliases.h>
 #include <Folders.h>
 #include <Memory.h>
+#include <TextUtils.h>
 #include <string.h>
 
-enum { kSettingsMagic = 'LnwP', kSettingsVersion = 2 };
+enum { kSettingsMagic = 'LnwP', kSettingsVersion = 3 };
 enum { kSidebarFlag = 1, kTypewriterFlag = 2, kCounterShift = 2, kOutlineFlag = 16 };
 
 typedef struct {
@@ -56,22 +57,95 @@ static OSErr WriteExact(short ref, const void *bytes, long length)
     return error == noErr && count == length ? noErr : error == noErr ? writErr : error;
 }
 
-OSErr SettingsLoad(AppSettings *settings)
+void SettingsRememberFile(AppSettings *settings, const FSSpec *file)
 {
-    SettingsDefaults(settings);
-    FSSpec file;
-    OSErr error = PreferencesFile(&file);
-    if(error != noErr)
-        return error;
+    FSSpec recent = *file;
+    unsigned i;
+    for(i = 0; i < settings->recentCount; ++i) {
+        const FSSpec *entry = &settings->recent[i];
+        if(entry->vRefNum == recent.vRefNum && entry->parID == recent.parID &&
+           EqualString(entry->name, recent.name, false, true))
+            break;
+    }
+    if(i == settings->recentCount && i < kRecentFileLimit)
+        ++settings->recentCount;
+    if(i == kRecentFileLimit)
+        --i;
+    memmove(settings->recent + 1, settings->recent, i * sizeof(recent));
+    settings->recent[0] = recent;
+}
+
+static OSErr ReadAliases(short ref, unsigned count, FSSpec *files,
+                         unsigned limit, unsigned *resolved)
+{
+    for(unsigned i = 0; i < count; ++i) {
+        unsigned long size;
+        OSErr error = ReadExact(ref, &size, sizeof(size));
+        if(error != noErr)
+            return error;
+        if(size == 0 || size > 64 * 1024)
+            return paramErr;
+        AliasHandle alias = (AliasHandle)NewHandle(size);
+        if(alias == NULL)
+            return memFullErr;
+        HLock((Handle)alias);
+        error = ReadExact(ref, *alias, size);
+        HUnlock((Handle)alias);
+        if(error == noErr && *resolved < limit) {
+            Boolean changed;
+            if(ResolveAlias(NULL, alias, &files[*resolved], &changed) == noErr)
+                ++*resolved;
+        }
+        DisposeHandle((Handle)alias);
+        if(error != noErr)
+            return error;
+    }
+    return noErr;
+}
+
+static OSErr WriteAlias(short ref, AliasHandle alias)
+{
+    unsigned long size = GetHandleSize((Handle)alias);
+    OSErr error = WriteExact(ref, &size, sizeof(size));
+    if(error == noErr) {
+        HLock((Handle)alias);
+        error = WriteExact(ref, *alias, size);
+        HUnlock((Handle)alias);
+    }
+    return error;
+}
+
+static OSErr WriteRecentFiles(short ref, const AppSettings *settings)
+{
+    AliasHandle aliases[kRecentFileLimit];
+    unsigned short count = 0;
+    for(unsigned i = 0; i < settings->recentCount; ++i) {
+        AliasHandle alias = NULL;
+        if(NewAliasMinimal(&settings->recent[i], &alias) == noErr)
+            aliases[count++] = alias;
+        else if(alias != NULL)
+            DisposeHandle((Handle)alias);
+    }
+    OSErr error = WriteExact(ref, &count, sizeof(count));
+    for(unsigned i = 0; i < count; ++i) {
+        if(error == noErr)
+            error = WriteAlias(ref, aliases[i]);
+        DisposeHandle((Handle)aliases[i]);
+    }
+    return error;
+}
+
+static OSErr LoadSettingsFile(const FSSpec *file, AppSettings *settings)
+{
     short ref;
-    error = FSpOpenDF(&file, fsRdPerm, &ref);
+    OSErr error = FSpOpenDF(file, fsRdPerm, &ref);
     if(error != noErr)
         return error;
 
     SettingsHeader header;
     error = ReadExact(ref, &header, sizeof(header));
     if(error == noErr && (header.magic != kSettingsMagic ||
-                          (header.version != 1 && header.version != kSettingsVersion) ||
+                          header.version < 1 || header.version > kSettingsVersion ||
                           header.font[0] > 63))
         error = paramErr;
     if(error == noErr) {
@@ -79,7 +153,7 @@ OSErr SettingsLoad(AppSettings *settings)
         settings->points = header.points;
         settings->lineSpacing = header.lineSpacing;
         settings->sidebarVisible = (header.viewFlags & kSidebarFlag) != 0;
-        if(header.version == kSettingsVersion) {
+        if(header.version >= 2) {
             settings->typewriter = (header.viewFlags & kTypewriterFlag) != 0;
             settings->outlineVisible = (header.viewFlags & kOutlineFlag) != 0;
             unsigned counter = (header.viewFlags >> kCounterShift) & 3;
@@ -88,45 +162,32 @@ OSErr SettingsLoad(AppSettings *settings)
         }
         settings->window = header.window;
         memcpy(settings->font, header.font, sizeof(settings->font));
-        unsigned count = header.rootCount > kSettingsRootLimit
-            ? kSettingsRootLimit : header.rootCount;
-        for(unsigned i = 0; i < header.rootCount && error == noErr; ++i) {
-            unsigned long size;
-            error = ReadExact(ref, &size, sizeof(size));
-            if(error == noErr && (size == 0 || size > 64 * 1024))
-                error = paramErr;
-            Handle alias = error == noErr ? NewHandle(size) : NULL;
-            if(error == noErr && alias == NULL)
-                error = memFullErr;
-            if(error == noErr) {
-                HLock(alias);
-                error = ReadExact(ref, *alias, size);
-                HUnlock(alias);
-            }
-            if(error == noErr && i < count) {
-                Boolean changed;
-                FSSpec root;
-                if(ResolveAlias(NULL, (AliasHandle)alias, &root, &changed) == noErr)
-                    settings->roots[settings->rootCount++] = root;
-            }
-            if(alias != NULL)
-                DisposeHandle(alias);
+        error = ReadAliases(ref, header.rootCount, settings->roots, kSettingsRootLimit,
+                            &settings->rootCount);
+        if(error == noErr && header.version >= 3) {
+            unsigned short count;
+            error = ReadExact(ref, &count, sizeof(count));
+            if(error == noErr)
+                error = ReadAliases(ref, count, settings->recent, kRecentFileLimit,
+                                    &settings->recentCount);
         }
     }
     OSErr closeError = FSClose(ref);
     return error == noErr ? closeError : error;
 }
 
-OSErr SettingsSave(const AppSettings *settings)
+OSErr SettingsLoad(AppSettings *settings)
 {
+    SettingsDefaults(settings);
     FSSpec file;
     OSErr error = PreferencesFile(&file);
-    if(error == fnfErr)
-        error = FSpCreate(&file, 'Lnwr', 'pref', smSystemScript);
-    if(error != noErr)
-        return error;
+    return error == noErr ? LoadSettingsFile(&file, settings) : error;
+}
+
+static OSErr SaveSettingsFile(const FSSpec *file, const AppSettings *settings)
+{
     short ref;
-    error = FSpOpenDF(&file, fsWrPerm, &ref);
+    OSErr error = FSpOpenDF(file, fsWrPerm, &ref);
     if(error != noErr)
         return error;
     error = SetEOF(ref, 0);
@@ -146,22 +207,48 @@ OSErr SettingsSave(const AppSettings *settings)
     for(unsigned i = 0; i < settings->rootCount && error == noErr; ++i) {
         AliasHandle alias = NULL;
         error = NewAliasMinimal(&settings->roots[i], &alias);
-        if(error == noErr) {
-            unsigned long size = GetHandleSize((Handle)alias);
-            error = WriteExact(ref, &size, sizeof(size));
-            if(error == noErr) {
-                HLock((Handle)alias);
-                error = WriteExact(ref, *alias, size);
-                HUnlock((Handle)alias);
-            }
-        }
+        if(error == noErr)
+            error = WriteAlias(ref, alias);
         if(alias != NULL)
             DisposeHandle((Handle)alias);
     }
+    if(error == noErr)
+        error = WriteRecentFiles(ref, settings);
     OSErr closeError = FSClose(ref);
     if(error == noErr)
         error = closeError;
     if(error == noErr)
-        error = FlushVol(NULL, file.vRefNum);
+        error = FlushVol(NULL, file->vRefNum);
     return error;
 }
+
+OSErr SettingsSave(const AppSettings *settings)
+{
+    FSSpec file;
+    OSErr error = PreferencesFile(&file);
+    if(error == fnfErr)
+        error = FSpCreate(&file, 'Lnwr', 'pref', smSystemScript);
+    return error == noErr ? SaveSettingsFile(&file, settings) : error;
+}
+
+#ifdef LINEWREN_SMOKE_TEST
+Boolean SettingsSmokeRecent(const AppSettings *settings)
+{
+    const FSSpec *recent = &settings->recent[0];
+    FSSpec fixture;
+    if(FSMakeFSSpec(recent->vRefNum, recent->parID, "\pLinewren Recent Test", &fixture) != fnfErr ||
+       FSpCreate(&fixture, 'Lnwr', 'pref', smSystemScript) != noErr)
+        return false;
+    AppSettings loaded;
+    SettingsDefaults(&loaded);
+    Boolean matches = SaveSettingsFile(&fixture, settings) == noErr &&
+                      LoadSettingsFile(&fixture, &loaded) == noErr &&
+                      loaded.recentCount == settings->recentCount;
+    for(unsigned i = 0; matches && i < loaded.recentCount; ++i) {
+        matches = loaded.recent[i].parID == settings->recent[i].parID &&
+                  EqualString(loaded.recent[i].name, settings->recent[i].name, true, true);
+    }
+    FSpDelete(&fixture);
+    return matches;
+}
+#endif

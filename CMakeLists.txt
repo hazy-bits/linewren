@@ -66,8 +66,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
     target_sources(Linewren PRIVATE src/carbon-alloc.c)
     target_compile_definitions(Linewren PRIVATE realloc=LinewrenCarbonRealloc)
 else()
-    target_link_libraries(Linewren PRIVATE NavigationLib InputSprocketLib ATSUnicodeLib
-                                        UnicodeConverter FontManager InternetConfigLib)
+    target_link_libraries(Linewren PRIVATE AppearanceLib NavigationLib InputSprocketLib ATSUnicodeLib
+                                        UnicodeConverter FontManager InternetConfigLib DragLib)
 endif()
 
 set_target_properties(Linewren PROPERTIES COMPILE_OPTIONS -ffunction-sections)

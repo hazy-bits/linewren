@@ -20,11 +20,11 @@ enum {
     kSelectAllItem = 7,
     kBoldItem = 9,
     kItalicItem = 10,
-    kLinkItem = 16,
-    kHeadingItem = 17,
-    kQuoteItem = 18,
-    kListItem = 19,
-    kTaskItem = 20
+    kLinkItem = 17,
+    kHeadingItem = 18,
+    kQuoteItem = 19,
+    kListItem = 20,
+    kTaskItem = 21
 };
 
 Boolean EditorInit(void);
@@ -35,6 +35,11 @@ void EditorDraw(Editor *editor);
 void EditorResize(Editor *editor, const Rect *view, const Rect *outline);
 void EditorActivate(Editor *editor, Boolean active);
 void EditorClick(Editor *editor, const EventRecord *event);
+Boolean EditorDropText(Editor *editor, Point point, Handle data, OSType flavor);
+RgnHandle EditorTextDragRegion(Editor *editor, Point point);
+Handle EditorCopySelectedText(Editor *editor);
+Rect EditorTextDropCaret(Editor *editor, Point point, Boolean copy);
+Boolean EditorDropSelection(Editor *editor, Point point, Boolean copy);
 Boolean EditorContextMenu(Editor *editor, Point point, Str255 find);
 Boolean EditorFindSelection(const Editor *editor, Str255 query);
 void EditorKey(Editor *editor, const EventRecord *event);

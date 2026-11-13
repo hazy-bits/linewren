@@ -1,9 +1,11 @@
 #include "mac-toolbox.h"
 #include "editor.h"
 #include "settings.h"
+#include "text-files.h"
 #include "workspace.h"
 #if TARGET_API_MAC_CARBON
 #include <CarbonEvents.h>
+#include <CFURL.h>
 #include <Navigation.h>
 #else
 #include <InputSprocket.h>
@@ -13,6 +15,7 @@
 #include <Devices.h>
 #include <AppleEvents.h>
 #include <Dialogs.h>
+#include <Drag.h>
 #include <Events.h>
 #include <Fonts.h>
 #include <Memory.h>
@@ -40,10 +43,12 @@ enum {
     kEditMenu = 130,
     kViewMenu = 131,
     kFontMenu = 133,
-    kSizeMenu = 134
+    kSizeMenu = 134,
+    kWindowMenu = 137,
+    kRecentMenu = 138
 };
 
-enum { kFindItem = 12, kFindNextItem = 13, kReplaceItem = 14 };
+enum { kFindItem = 12, kFindNextItem = 13, kFindPreviousItem = 14, kReplaceItem = 15 };
 static Str255 gFindText;
 static Str255 gReplaceText;
 enum { kFindRow = 24 };
@@ -58,15 +63,24 @@ static Rect FindBounds(WindowRef window);
 enum {
     kAboutItem = 1,
     kNewItem = 1,
-    kCloseItem = 3,
-    kQuitItem = 4,
-    kOpenItem = 6,
-    kOpenFolderItem = 7,
+    kOpenItem = 2,
+    kOpenRecentItem = 3,
+    kQuickOpenItem = 4,
+    kOpenFolderItem = 5,
+    kCloseItem = 7,
     kSaveItem = 8,
     kSaveAsItem = 9,
-    kQuickOpenItem = 11
+    kQuitItem = 11
 };
 
+#if TARGET_API_MAC_CARBON
+enum { kMinimizeItem = 1, kZoomItem = 2 };
+#else
+enum { kZoomItem = 1 };
+#endif
+enum { kFirstDocumentItem = kZoomItem + 2 };
+static MenuRef gWindowMenu, gRecentMenu;
+static OSStatus ZoomDocument(WindowRef window, short part);
 static Rect gNextWindowRect;
 static Boolean gRunning = true;
 static AppSettings gSettings;
@@ -82,6 +96,13 @@ static struct {
     unsigned selected;
 } gQuickOpen;
 static void DismissQuickOpen(void);
+static DragTrackingHandlerUPP gTrackDrop;
+static DragReceiveHandlerUPP gReceiveDrop;
+static struct {
+    DragRef drag;
+    WindowRef source;
+    Rect caret;
+} gTextDrag;
 
 enum {
     kLightTheme = 1, kDarkTheme = 2, kSidebarItem = 4, kFocusItem = 5,
@@ -226,6 +247,67 @@ static Editor *GetDocument(WindowRef window)
     return (Editor *)GetWRefCon(window);
 }
 
+static WindowRef FirstWindow(void)
+{
+#if TARGET_API_MAC_CARBON
+    return GetWindowList();
+#else
+    return FrontWindow();
+#endif
+}
+
+static Boolean InitDocumentMenus(void)
+{
+    gWindowMenu = GetMenu(kWindowMenu);
+    gRecentMenu = NewMenu(kRecentMenu, "\pOpen Recent");
+    if(gWindowMenu == NULL || gRecentMenu == NULL)
+        return false;
+#if TARGET_API_MAC_CARBON
+    InsertMenuItem(gWindowMenu, "\pMinimize/M", 0);
+#endif
+    InsertMenu(gWindowMenu, 0);
+    InsertMenu(gRecentMenu, hierMenu);
+    SetMenuItemHierarchicalID(GetMenu(kFileMenu), kOpenRecentItem, kRecentMenu);
+    SetMenuItemModifiers(GetMenu(kFileMenu), kSaveAsItem, kMenuShiftModifier);
+    SetMenuItemModifiers(GetMenu(kEditMenu), kRedoItem, kMenuShiftModifier);
+    SetMenuItemModifiers(GetMenu(kEditMenu), kFindPreviousItem, kMenuShiftModifier);
+    return true;
+}
+
+static void AppendMenuLabel(MenuRef menu, ConstStr255Param label)
+{
+    AppendMenu(menu, "\pX");
+    SetMenuItemText(menu, CountMenuItems(menu), label);
+}
+
+static void RefreshDocumentMenus(void)
+{
+    while(CountMenuItems(gRecentMenu) > 0)
+        DeleteMenuItem(gRecentMenu, CountMenuItems(gRecentMenu));
+    for(unsigned i = 0; i < gSettings.recentCount; ++i)
+        AppendMenuLabel(gRecentMenu, gSettings.recent[i].name);
+    if(gSettings.recentCount > 0)
+        AppendMenu(gRecentMenu, "\p-;Clear Menu");
+
+    while(CountMenuItems(gWindowMenu) >= kFirstDocumentItem)
+        DeleteMenuItem(gWindowMenu, CountMenuItems(gWindowMenu));
+    for(WindowRef window = FirstWindow(); window != NULL; window = GetNextWindow(window)) {
+        if(GetDocument(window) != NULL) {
+            Str255 title;
+            GetWTitle(window, title);
+            AppendMenuLabel(gWindowMenu, title);
+            CheckMenuItem(gWindowMenu, CountMenuItems(gWindowMenu), window == FrontWindow());
+        }
+    }
+}
+
+static void SelectDocument(WindowRef window)
+{
+    if(IsWindowCollapsed(window))
+        CollapseWindow(window, false);
+    SelectWindow(window);
+}
+
 enum { kOutlineWidth = 148, kOutlineFirstRow = 4, kOutlineRowHeight = 16, kOutlinePager = 22 };
 
 static Rect EditorBounds(WindowRef window)
@@ -309,7 +391,7 @@ static WindowRef NewDocument(OSStatus *outStatus)
     SetWTitle(window, title);
 #else
     window = NewCWindow(NULL, &gNextWindowRect, title, false,
-                        documentProc, (WindowPtr)-1, true, 0);
+                        zoomDocProc, (WindowPtr)-1, true, 0);
     if(window == NULL) {
         if(outStatus != NULL)
             *outStatus = memFullErr;
@@ -336,6 +418,17 @@ static WindowRef NewDocument(OSStatus *outStatus)
     Rect outline = OutlineBounds(view);
     if(!EmptyRect(&outline))
         EditorResize(editor, &view, &outline);
+    status = memFullErr;
+    if(gTrackDrop != NULL && gReceiveDrop != NULL) {
+        status = InstallTrackingHandler(gTrackDrop, window, NULL);
+        if(status == noErr) {
+            status = InstallReceiveHandler(gReceiveDrop, window, NULL);
+            if(status != noErr)
+                RemoveTrackingHandler(gTrackDrop, window);
+        }
+    }
+    if(outStatus != NULL)
+        *outStatus = status;
     ShowWindow(window);
     EditorActivate(editor, true);
 
@@ -406,6 +499,10 @@ static void CloseDocument(WindowRef window)
         return;
     editor = GetDocument(window);
     if(editor != NULL) {
+        if(gTrackDrop != NULL)
+            RemoveTrackingHandler(gTrackDrop, window);
+        if(gReceiveDrop != NULL)
+            RemoveReceiveHandler(gReceiveDrop, window);
         if(gQuickOpen.visible && gQuickOpen.window == window)
             DismissQuickOpen();
         if(gFind.window == window)
@@ -428,21 +525,44 @@ static Boolean CanClose(WindowRef window)
     return true;
 }
 
-static void OpenDocument(WindowRef source, const FSSpec *file)
+static void RememberDocument(Editor *editor)
+{
+    const FSSpec *file = WorkspaceCurrentFile(EditorWorkspace(editor));
+    if(file != NULL)
+        SettingsRememberFile(&gSettings, file);
+}
+
+static OSErr OpenDocument(WindowRef source, const FSSpec *file)
 {
     CloseFind();
-    for(WindowRef window = FrontWindow(); window != NULL; window = GetNextWindow(window)) {
+    for(WindowRef window = FirstWindow(); window != NULL; window = GetNextWindow(window)) {
         Editor *editor = GetDocument(window);
         if(editor != NULL && WorkspaceHasFile(EditorWorkspace(editor), file)) {
-            if(window != source)
-                SelectWindow(window);
-            return;
+            SelectDocument(window);
+            RememberDocument(editor);
+            return noErr;
         }
     }
+    WindowRef previous = FrontWindow();
+    Boolean newWindow = source == NULL;
+    if(newWindow)
+        source = NewDocument(NULL);
     Editor *editor = GetDocument(source);
+    if(editor == NULL)
+        return memFullErr;
     OSErr error = WorkspaceOpen(editor, source, file);
-    if(error != noErr && error != userCanceledErr)
-        WorkspaceOpenError(EditorWorkspace(editor), source, error);
+    if(error == noErr) {
+        RememberDocument(editor);
+    } else {
+        if(newWindow && GetDocument(previous) != NULL) {
+            CloseDocument(source);
+            source = previous;
+            editor = GetDocument(source);
+        }
+        if(error != userCanceledErr)
+            WorkspaceOpenError(EditorWorkspace(editor), source, error);
+    }
+    return error;
 }
 
 static void ChooseDocument(WindowRef window)
@@ -474,11 +594,7 @@ static void ChooseDocument(WindowRef window)
         return;
     file = reply.sfFile;
 #endif
-    if(GetDocument(window) == NULL)
-        window = NewDocument(NULL);
-    if(window == NULL)
-        return;
-    OpenDocument(window, &file);
+    OpenDocument(GetDocument(window) != NULL ? window : NULL, &file);
 }
 
 static Rect QuickOpenBounds(WindowRef window)
@@ -497,6 +613,302 @@ static Rect QuickOpenBounds(WindowRef window)
                     (gQuickOpen.count == 0 ? kQuickRowHeight :
                                              gQuickOpen.count * kQuickRowHeight) + 6;
     return bounds;
+}
+
+enum { kDropFile = 1, kDropFolder = 2, kDropText = 4, kDropFileURL = 'furl' };
+
+static Boolean HasDropFlavor(DragRef drag, DragItemRef item, FlavorType flavor)
+{
+    FlavorFlags flags;
+    return GetFlavorFlags(drag, item, flavor, &flags) == noErr && !(flags & flavorSenderOnly);
+}
+
+static Handle ReadDropData(DragRef drag, DragItemRef item, FlavorType flavor, Size limit)
+{
+    Size size;
+    if(GetFlavorDataSize(drag, item, flavor, &size) != noErr || size <= 0 || size > limit)
+        return NULL;
+    Handle data = NewHandle(size);
+    if(data == NULL)
+        return NULL;
+    Size read = size;
+    HLock(data);
+    OSErr error = GetFlavorData(drag, item, flavor, *data, &read, 0);
+    HUnlock(data);
+    if(error == noErr && read == size)
+        return data;
+    DisposeHandle(data);
+    return NULL;
+}
+
+static OSErr ReadDropFile(DragRef drag, DragItemRef item, FSSpec *file)
+{
+    HFSFlavor hfs;
+    Size size = sizeof(hfs);
+    if(GetFlavorData(drag, item, kDragFlavorTypeHFS, &hfs, &size, 0) == noErr &&
+       size == sizeof(hfs) && hfs.fileSpec.name[0] < sizeof(hfs.fileSpec.name)) {
+        *file = hfs.fileSpec;
+        return noErr;
+    }
+#if TARGET_API_MAC_CARBON
+    Handle data = ReadDropData(drag, item, kDropFileURL, kTextFileLimit);
+    if(data != NULL) {
+        HLock(data);
+        CFURLRef url = CFURLCreateWithBytes(NULL, (const UInt8 *)*data, GetHandleSize(data),
+                                           kCFStringEncodingUTF8, NULL);
+        DisposeHandle(data);
+        if(url != NULL) {
+            FSRef ref;
+            Boolean found = CFURLGetFSRef(url, &ref);
+            CFRelease(url);
+            if(found)
+                return FSGetCatalogInfo(&ref, kFSCatInfoNone, NULL, NULL, file, NULL);
+        }
+    }
+#endif
+    return dragNotAcceptedErr;
+}
+
+static unsigned DropItemKind(DragRef drag, DragItemRef item, FSSpec *file, long *directory,
+                             FlavorType *textFlavor)
+{
+    if(HasDropFlavor(drag, item, kDragFlavorTypeHFS) ||
+       HasDropFlavor(drag, item, kDropFileURL)) {
+        if(ReadDropFile(drag, item, file) == noErr &&
+           WorkspaceLocateFolder(file, directory) == noErr)
+            return *directory == 0 ? kDropFile : kDropFolder;
+        return 0;
+    }
+    if(HasDropFlavor(drag, item, kDragFlavorTypePromiseHFS))
+        return 0;
+    const FlavorType textFlavors[] = {'utxt', 'utf8', 'TEXT'};
+    for(unsigned i = 0; i < sizeof(textFlavors) / sizeof(textFlavors[0]); ++i) {
+        if(HasDropFlavor(drag, item, textFlavors[i])) {
+            *textFlavor = textFlavors[i];
+            return kDropText;
+        }
+    }
+    return 0;
+}
+
+static Rect DropTarget(WindowRef window, Point point, unsigned kinds)
+{
+    Rect canvas = WindowCanvas(window);
+    if(!gFocusMode)
+        canvas.bottom -= 23;
+    if(gSidebarVisible && !gFocusMode) {
+        Rect sidebar = canvas;
+        sidebar.right = kSidebarWidth;
+        if(PtInRect(point, &sidebar))
+            return kinds & (kDropFile | kDropFolder) ? sidebar : (Rect){0};
+        canvas.left = sidebar.right;
+    }
+    if((kinds & kDropFile) && PtInRect(point, &canvas))
+        return canvas;
+    if(!(kinds & kDropText))
+        return (Rect){0};
+    Rect view = EditorBounds(window);
+    Rect outline = OutlineBounds(view);
+    view.right = EmptyRect(&outline) ? view.right - kEditorScrollbarWidth : outline.left;
+    Rect find = gFind.window == window ? FindBounds(window) : (Rect){0};
+    Rect quick = gQuickOpen.window == window ? QuickOpenBounds(window) : (Rect){0};
+    if(PtInRect(point, &view) && !PtInRect(point, &find) && !PtInRect(point, &quick))
+        return view;
+    return (Rect){0};
+}
+
+/* A null point inspects the items for tracking feedback without accepting them. */
+static unsigned ProcessDrop(DragRef drag, WindowRef window, const Point *point)
+{
+    UInt16 count;
+    if(CountDragItems(drag, &count) != noErr)
+        return 0;
+    unsigned accepted = 0;
+    Editor *editor = GetDocument(window);
+    for(unsigned i = 1; i <= count; ++i) {
+        DragItemRef item;
+        if(GetDragItemReferenceNumber(drag, i, &item) != noErr)
+            continue;
+        FSSpec file;
+        long directory;
+        FlavorType flavor;
+        unsigned kind = DropItemKind(drag, item, &file, &directory, &flavor);
+        if(kind == 0 || (kind == kDropText && count != 1))
+            continue;
+        if(point == NULL) {
+            accepted |= kind;
+            continue;
+        }
+        Rect target = DropTarget(window, *point, kind);
+        if(EmptyRect(&target))
+            continue;
+        OSErr error;
+        if(kind == kDropFile) {
+            error = OpenDocument(NULL, &file);
+        } else if(kind == kDropFolder) {
+            error = WorkspaceAttachFolder(EditorWorkspace(editor), window, file.vRefNum, directory);
+            if(error == noErr)
+                SelectDocument(window);
+            else
+                WorkspaceOpenError(EditorWorkspace(editor), window, error);
+        } else {
+            Handle data = ReadDropData(drag, item, flavor, 2 * kTextFileLimit);
+            if(data == NULL)
+                continue;
+            SetPortWindowPort(window);
+            Boolean inserted = EditorDropText(editor, *point, data, flavor);
+            DisposeHandle(data);
+            if(inserted)
+                SelectDocument(window);
+            error = inserted ? noErr : dragNotAcceptedErr;
+        }
+        if(error == noErr)
+            accepted |= kind;
+    }
+    return accepted;
+}
+
+static void ShowTextDropCaret(Rect caret)
+{
+    if(EqualRect(&gTextDrag.caret, &caret))
+        return;
+    if(!EmptyRect(&gTextDrag.caret))
+        InvertRect(&gTextDrag.caret);
+    if(!EmptyRect(&caret))
+        InvertRect(&caret);
+    gTextDrag.caret = caret;
+#if TARGET_API_MAC_CARBON
+    GrafPtr port;
+    GetPort(&port);
+    QDFlushPortBuffer((CGrafPtr)port, NULL);
+#endif
+}
+
+static OSErr TrackTextDrag(WindowRef window, const EventRecord *event, RgnHandle region, DragRef drag)
+{
+    Handle text = EditorCopySelectedText(GetDocument(window));
+    if(text == NULL)
+        return memFullErr;
+    HLock(text);
+    OSErr error = AddDragItemFlavor(drag, 1, 'utxt', *text, GetHandleSize(text), 0);
+    DisposeHandle(text);
+    if(error != noErr)
+        return error;
+    Point origin = {0, 0};
+    LocalToGlobal(&origin);
+    OffsetRgn(region, origin.h, origin.v);
+    gTextDrag.drag = drag;
+    gTextDrag.source = window;
+    error = TrackDrag(drag, event, region);
+    SetPortWindowPort(window);
+    ShowTextDropCaret((Rect){0});
+    gTextDrag.drag = NULL;
+    gTextDrag.source = NULL;
+    return error;
+}
+
+static Boolean TrackSelectedText(WindowRef window, const EventRecord *event)
+{
+    if(event->modifiers & (shiftKey | cmdKey | controlKey))
+        return false;
+    Point point = event->where;
+    GlobalToLocal(&point);
+    Editor *editor = GetDocument(window);
+    RgnHandle region = EditorTextDragRegion(editor, point);
+    if(region == NULL)
+        return false;
+    Boolean tracking = WaitMouseMoved(event->where);
+    if(tracking) {
+        DragRef drag;
+        if(NewDrag(&drag) == noErr) {
+            TrackTextDrag(window, event, region, drag);
+            DisposeDrag(drag);
+        }
+    }
+    DisposeRgn(region);
+    return tracking;
+}
+
+static OSErr TrackDrop(DragTrackingMessage message, WindowRef window, void *refcon, DragRef drag)
+{
+    (void)refcon;
+    static unsigned kinds;
+    static Rect highlight;
+    if(message == kDragTrackingEnterHandler)
+        highlight = (Rect){0};
+    if(window == NULL || (message != kDragTrackingEnterWindow && message != kDragTrackingInWindow &&
+                          message != kDragTrackingLeaveWindow))
+        return noErr;
+    GrafPtr port;
+    GetPort(&port);
+    SetPortWindowPort(window);
+    if(gTextDrag.drag == drag && gTextDrag.source == window) {
+        Point point;
+        Rect caret = {0};
+        if(message != kDragTrackingLeaveWindow && GetDragMouse(drag, &point, NULL) == noErr) {
+            GlobalToLocal(&point);
+            Rect target = DropTarget(window, point, kDropText);
+            if(!EmptyRect(&target)) {
+                SInt16 modifiers = 0;
+                GetDragModifiers(drag, &modifiers, NULL, NULL);
+                caret = EditorTextDropCaret(GetDocument(window), point, (modifiers & optionKey) != 0);
+            }
+        }
+        ShowTextDropCaret(caret);
+        SetPort(port);
+        return noErr;
+    }
+    Rect target = {0};
+    if(message != kDragTrackingLeaveWindow) {
+        if(message == kDragTrackingEnterWindow)
+            kinds = ProcessDrop(drag, window, NULL);
+        Point point;
+        if(GetDragMouse(drag, &point, NULL) == noErr) {
+            GlobalToLocal(&point);
+            target = DropTarget(window, point, kinds);
+        }
+    }
+    if(!EqualRect(&target, &highlight)) {
+        if(!EmptyRect(&highlight))
+            HideDragHilite(drag);
+        highlight = (Rect){0};
+        if(!EmptyRect(&target)) {
+            RgnHandle region = NewRgn();
+            if(region != NULL) {
+                RectRgn(region, &target);
+                if(ShowDragHilite(drag, region, true) == noErr)
+                    highlight = target;
+                DisposeRgn(region);
+            }
+        }
+    }
+    SetPort(port);
+    return noErr;
+}
+
+static OSErr ReceiveDrop(WindowRef window, void *refcon, DragRef drag)
+{
+    (void)refcon;
+    Point point;
+    if(GetDragMouse(drag, &point, NULL) != noErr)
+        return dragNotAcceptedErr;
+    GrafPtr port;
+    GetPort(&port);
+    SetPortWindowPort(window);
+    GlobalToLocal(&point);
+    Boolean accepted;
+    if(gTextDrag.drag == drag && gTextDrag.source == window) {
+        ShowTextDropCaret((Rect){0});
+        Rect target = DropTarget(window, point, kDropText);
+        SInt16 modifiers = 0;
+        GetDragModifiers(drag, NULL, NULL, &modifiers);
+        accepted = !EmptyRect(&target) &&
+                   EditorDropSelection(GetDocument(window), point, (modifiers & optionKey) != 0);
+    } else {
+        accepted = ProcessDrop(drag, window, &point) != 0;
+    }
+    SetPort(port);
+    return accepted != 0 ? noErr : dragNotAcceptedErr;
 }
 
 static void RefreshQuickOpen(void)
@@ -604,6 +1016,23 @@ static void UpdateMenus(void)
     WindowRef window = FrontWindow();
     Editor *editor = GetDocument(window);
     Boolean hasEditor = editor != NULL;
+
+    if(gSettings.recentCount > 0)
+        EnableMenuItem(fileMenu, kOpenRecentItem);
+    else
+        DisableMenuItem(fileMenu, kOpenRecentItem);
+
+    if(hasEditor && !IsWindowCollapsed(window)) {
+        EnableMenuItem(gWindowMenu, kZoomItem);
+#if TARGET_API_MAC_CARBON
+        EnableMenuItem(gWindowMenu, kMinimizeItem);
+#endif
+    } else {
+        DisableMenuItem(gWindowMenu, kZoomItem);
+#if TARGET_API_MAC_CARBON
+        DisableMenuItem(gWindowMenu, kMinimizeItem);
+#endif
+    }
 
     if(hasEditor)
         EnableMenuItem(fileMenu, kCloseItem);
@@ -1063,8 +1492,8 @@ static void DoMenuCommand(long command)
                         ShowQuickOpen(window);
                     else if(item == kOpenFolderItem)
                         WorkspaceChooseFolder(EditorWorkspace(editor), window);
-                    else
-                        WorkspaceSave(editor, window, item == kSaveAsItem);
+                    else if(WorkspaceSave(editor, window, item == kSaveAsItem))
+                        RememberDocument(editor);
                 }
                 break;
             }
@@ -1076,13 +1505,52 @@ static void DoMenuCommand(long command)
             if(item == kFindItem && gFind.window != front)
                 EditorFindSelection(editor, gFindText);
             ShowFind(front, item == kReplaceItem);
-        } else if(editor != NULL && item == kFindNextItem)
-            RunFind(front, 1);
+        } else if(editor != NULL && (item == kFindNextItem || item == kFindPreviousItem))
+            RunFind(front, item == kFindPreviousItem ? -1 : 1);
         else
             DoEditCommand(item);
         if(editor != NULL) {
             SetPortWindowPort(front);
             InvalidateFooter(front);
+        }
+    } else if(menu == kRecentMenu) {
+        if(item >= 1 && (unsigned)item <= gSettings.recentCount) {
+            FSSpec file = gSettings.recent[item - 1];
+            OSErr error = OpenDocument(NULL, &file);
+            if(error == fnfErr || error == dirNFErr || error == nsvErr) {
+                --gSettings.recentCount;
+                memmove(gSettings.recent + item - 1, gSettings.recent + item,
+                        (gSettings.recentCount - (item - 1)) * sizeof(file));
+            }
+        } else if((unsigned)item == gSettings.recentCount + 2) {
+            gSettings.recentCount = 0;
+        }
+    } else if(menu == kWindowMenu) {
+        window = FrontWindow();
+        if(item == kZoomItem && GetDocument(window) != NULL && !IsWindowCollapsed(window)) {
+#if TARGET_API_MAC_CARBON
+            ZoomDocument(window, inZoomOut);
+#else
+            SetPortWindowPort(window);
+            Rect current = WindowCanvas(window), standard = {0};
+            Point origin = {0, 0};
+            LocalToGlobal(&origin);
+            OffsetRect(&current, origin.h, origin.v);
+            GetWindowStandardState(window, &standard);
+            ZoomDocument(window, EqualRect(&current, &standard) ? inZoomIn : inZoomOut);
+#endif
+#if TARGET_API_MAC_CARBON
+        } else if(item == kMinimizeItem && GetDocument(window) != NULL) {
+            CollapseWindow(window, true);
+#endif
+        } else if(item >= kFirstDocumentItem) {
+            short remaining = item - kFirstDocumentItem;
+            for(window = FirstWindow(); window != NULL; window = GetNextWindow(window)) {
+                if(GetDocument(window) != NULL && remaining-- == 0) {
+                    SelectDocument(window);
+                    break;
+                }
+            }
         }
     } else if(menu == kFontMenu || menu == kSizeMenu) {
         DoTypographyCommand(menu, item);
@@ -1328,9 +1796,10 @@ static void SizeDocument(WindowRef window, short width, short height)
     RelayoutDocument(window);
 }
 
-#if TARGET_API_MAC_CARBON
-static OSStatus ZoomDocument(WindowRef window)
+static OSStatus ZoomDocument(WindowRef window, short part)
 {
+#if TARGET_API_MAC_CARBON
+    (void)part;
     Rect current, target;
     OSStatus status = GetWindowBounds(window, kWindowContentRgn, &current);
     if(status != noErr)
@@ -1349,13 +1818,15 @@ static OSStatus ZoomDocument(WindowRef window)
     status = SetWindowBounds(window, kWindowContentRgn, &target);
     if((restore && status == noErr) || (!restore && status != noErr))
         RemoveWindowProperty(window, 'Lnwr', 'zoom');
-    if(status == noErr) {
-        RelayoutDocument(window);
-        DrawDocument(window);
-    }
-    return status;
-}
+    if(status != noErr)
+        return status;
+#else
+    ZoomWindow(window, part, true);
 #endif
+    RelayoutDocument(window);
+    DrawDocument(window);
+    return noErr;
+}
 
 static void ActivateDocument(WindowRef window, Boolean active)
 {
@@ -1376,6 +1847,7 @@ static void HandleMouseDown(EventRecord *event)
 
     switch(part) {
         case inMenuBar:
+            RefreshDocumentMenus();
             UpdateMenus();
             DoMenuCommand(MenuSelect(event->where));
             break;
@@ -1383,13 +1855,11 @@ static void HandleMouseDown(EventRecord *event)
             if(TrackGoAway(window, event->where) && CanClose(window))
                 CloseDocument(window);
             break;
-#if TARGET_API_MAC_CARBON
         case inZoomIn:
         case inZoomOut:
             if(GetDocument(window) != NULL && TrackBox(window, event->where, part))
-                ZoomDocument(window);
+                ZoomDocument(window, part);
             break;
-#endif
         case inDrag: {
             Rect screen = MainScreenBounds();
             DragWindow(window, event->where, &screen);
@@ -1474,7 +1944,7 @@ static void HandleMouseDown(EventRecord *event)
                         if(EditorContextMenu(editor, point, gFindText))
                             ShowFind(window, false);
                         InvalidateFooter(window);
-                    } else {
+                    } else if(!TrackSelectedText(window, event)) {
                         EditorClick(editor, event);
                     }
                 }
@@ -1595,6 +2065,20 @@ static void PollWheelInput(void)
 }
 #endif
 
+static long CommandMenuSelection(const EventRecord *event)
+{
+    unsigned char key = event->message & charCodeMask;
+    if((event->modifiers & (shiftKey | optionKey | controlKey)) == shiftKey &&
+       GetDocument(FrontWindow()) != NULL) {
+        switch(key) {
+            case 'S': case 's': return ((long)kFileMenu << 16) | kSaveAsItem;
+            case 'G': case 'g': return ((long)kEditMenu << 16) | kFindPreviousItem;
+            case 'Z': case 'z': return ((long)kEditMenu << 16) | kRedoItem;
+        }
+    }
+    return MenuKey(key);
+}
+
 static void HandleKeyDown(EventRecord *event)
 {
     if(FindKey(event))
@@ -1645,11 +2129,7 @@ static void HandleKeyDown(EventRecord *event)
             }
         } else {
             UpdateMenus();
-            if((key == 'Z' || key == 'z') && (event->modifiers & shiftKey) &&
-               !(event->modifiers & (optionKey | controlKey)))
-                DoMenuCommand(((long)kEditMenu << 16) | kRedoItem);
-            else
-                DoMenuCommand(MenuKey(key));
+            DoMenuCommand(CommandMenuSelection(event));
         }
         return;
     }
@@ -1709,17 +2189,10 @@ static pascal OSErr OpenDocuments(const AppleEvent *event, AppleEvent *reply, lo
             WindowRef window = i == 1 ? FrontWindow() : NULL;
             Editor *editor = GetDocument(window);
             if(editor == NULL || WorkspaceIsRecovered(EditorWorkspace(editor)))
-                window = NewDocument(NULL);
-            editor = GetDocument(window);
-            if(editor == NULL)
-                error = memFullErr;
-            else {
-                OSErr openError = WorkspaceOpen(editor, window, &file);
-                if(openError != noErr && openError != userCanceledErr) {
-                    WorkspaceOpenError(EditorWorkspace(editor), window, openError);
-                    error = openError;
-                }
-            }
+                window = NULL;
+            OSErr openError = OpenDocument(window, &file);
+            if(openError != userCanceledErr)
+                error = openError;
         }
     }
     AEDisposeDesc(&documents);
@@ -1877,6 +2350,141 @@ static Boolean SmokeSourceIs(Editor *editor, const char *expected)
     Boolean equal = GetHandleSize(bytes) == length && memcmp(*bytes, expected, length) == 0;
     DisposeHandle(bytes);
     return equal;
+}
+
+typedef struct {
+    Point destination;
+    SInt16 modifiers;
+    unsigned samples;
+} SmokeDragInput;
+
+static OSErr SmokeDragMouse(Point *mouse, SInt16 *modifiers, void *refcon, DragRef drag)
+{
+    (void)drag;
+    SmokeDragInput *input = refcon;
+    *mouse = input->destination;
+    *modifiers = input->modifiers | (input->samples++ >= 2 ? btnState : 0);
+    return noErr;
+}
+
+static OSErr SmokeTrackSelection(WindowRef window, Editor *editor, Point start,
+                                 Point destination, SInt16 modifiers)
+{
+    RgnHandle region = EditorTextDragRegion(editor, start);
+    if(region == NULL)
+        return dragNotAcceptedErr;
+    LocalToGlobal(&start);
+    LocalToGlobal(&destination);
+    EventRecord event = {.what = mouseDown, .where = start, .when = TickCount(), .modifiers = modifiers};
+    DragRef drag;
+    OSErr status = NewDrag(&drag);
+    if(status != noErr) {
+        DisposeRgn(region);
+        return status;
+    }
+    SmokeDragInput input = {.destination = destination, .modifiers = modifiers};
+    DragInputUPP inputProc = NewDragInputUPP(SmokeDragMouse);
+    status = inputProc != NULL ? SetDragInputProc(drag, inputProc, &input) : memFullErr;
+    if(status == noErr)
+        status = TrackTextDrag(window, &event, region, drag);
+    DisposeDrag(drag);
+    if(inputProc != NULL)
+        DisposeDragInputUPP(inputProc);
+    DisposeRgn(region);
+    return status;
+}
+
+static const char *SmokeSelectionDrag(WindowRef window, Editor *editor)
+{
+    static const UniChar source[] = u"one two three";
+    Handle text;
+    if(PtrToHand(source, &text, sizeof(source) - sizeof(*source)) != noErr)
+        return "FAIL: allocate the selection drag fixture";
+    if(EditorTakeText(editor, text) != noErr) {
+        DisposeHandle(text);
+        return "FAIL: load the selection drag fixture";
+    }
+    unsigned ordinal;
+    if(EditorSearch(editor, "\ptwo ", 1, &ordinal) != 1 || !EditorSelectionAt(editor, 4, 8))
+        return "FAIL: select the drag fixture";
+    DrawDocument(window);
+    Rect view = EditorBounds(window);
+    Point start = {view.top + 6, view.left};
+    RgnHandle region = NULL;
+    while(start.h < view.right && region == NULL) {
+        start.h += 4;
+        region = EditorTextDragRegion(editor, start);
+    }
+    if(region == NULL)
+        return "FAIL: selected text did not have a draggable region";
+    DisposeRgn(region);
+    Point beginning = {view.top + 6, view.left + 1};
+    if(SmokeTrackSelection(window, editor, start, beginning, 0) != noErr ||
+       !SmokeSourceIs(editor, "two one three") || !EditorSelectionAt(editor, 0, 4))
+        return "FAIL: native drag did not move the selected text to the pointer";
+    EditorCommand(editor, kUndoItem);
+    if(!SmokeSourceIs(editor, "one two three") || !EditorSelectionAt(editor, 4, 8))
+        return "FAIL: Undo did not restore the moved selection";
+    EditorCommand(editor, kRedoItem);
+    if(!SmokeSourceIs(editor, "two one three") || !EditorSelectionAt(editor, 0, 4))
+        return "FAIL: Redo did not restore the move";
+    EditorCommand(editor, kUndoItem);
+    if(EditorDropSelection(editor, start, false) || EditorCanUndo(editor) ||
+       !SmokeSourceIs(editor, "one two three") || !EditorSelectionAt(editor, 4, 8))
+        return "FAIL: dropping onto the original selection changed the document";
+    Point end = {view.bottom - 4, view.left + 1};
+    if(SmokeTrackSelection(window, editor, start, end, optionKey) != noErr ||
+       !SmokeSourceIs(editor, "one two threetwo ") || !EditorSelectionAt(editor, 13, 17))
+        return "FAIL: Option-drag did not copy the selection";
+    EditorCommand(editor, kUndoItem);
+    if(!SmokeSourceIs(editor, "one two three") || !EditorSelectionAt(editor, 4, 8))
+        return "FAIL: Undo did not remove the copied selection";
+    if(SmokeTrackSelection(window, editor, start, end, 0) != noErr ||
+       !SmokeSourceIs(editor, "one threetwo ") || !EditorSelectionAt(editor, 9, 13))
+        return "FAIL: dragging forward did not adjust the drop position";
+    return NULL;
+}
+
+static const char *SmokeTextDrop(WindowRef window, Editor *editor)
+{
+    static const UniChar source[] = u"Document";
+    static const UniChar unicode[] = u"\u00e9\r\n";
+    static const char utf8[] = "\xc3\xa9\n";
+    static const char roman[] = "\x8e\r";
+    const struct { FlavorType flavor; const void *data; Size size; } cases[] = {
+        {'utxt', unicode, sizeof(unicode) - sizeof(*unicode)},
+        {'utf8', utf8, sizeof(utf8) - 1},
+        {'TEXT', roman, sizeof(roman) - 1}
+    };
+    Handle text;
+    if(PtrToHand(source, &text, sizeof(source) - sizeof(*source)) != noErr)
+        return "FAIL: allocate the text drop fixture";
+    if(EditorTakeText(editor, text) != noErr) {
+        DisposeHandle(text);
+        return "FAIL: load the text drop fixture";
+    }
+    EditorCommand(editor, kSelectAllItem);
+    Rect view = EditorBounds(window);
+    Point sidebar = {view.top + 1, 10};
+    Point start = {view.top + 1, view.left + 1};
+    for(unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        DragRef drag;
+        if(NewDrag(&drag) != noErr)
+            return "FAIL: create the text drag";
+        Boolean accepted = AddDragItemFlavor(drag, 1, cases[i].flavor, cases[i].data,
+                                             cases[i].size, 0) == noErr &&
+                           ProcessDrop(drag, window, NULL) == kDropText &&
+                           ProcessDrop(drag, window, &sidebar) == 0 &&
+                           ProcessDrop(drag, window, &start) == kDropText;
+        DisposeDrag(drag);
+        if(!accepted || !SmokeSourceIs(editor, "\xc3\xa9\nDocument") ||
+           !EditorSelectionAt(editor, 2, 2))
+            return "FAIL: a text drop did not insert at the pointer";
+        EditorCommand(editor, kUndoItem);
+        if(!SmokeSourceIs(editor, "Document") || !EditorAllSelected(editor))
+            return "FAIL: Undo did not restore text and selection after a drop";
+    }
+    return NULL;
 }
 
 static const char *SmokeFormatting(Editor *editor)
@@ -2220,6 +2828,14 @@ static const char *SmokeFind(Editor *editor, WindowRef window)
     DispatchEvent(&key);
     if(gFind.ordinal != 2)
         return "FAIL: Shift-Return did not find the previous match";
+    CloseFind();
+    key.modifiers = cmdKey | shiftKey;
+    key.message = 'g';
+    DispatchEvent(&key);
+    if(!EditorSelectionAt(editor, 0, 3))
+        return "FAIL: Command-Shift-G did not find the previous match with Find closed";
+    ShowFind(window, false);
+    RunFind(window, 1);
 
     Rect bounds = FindBounds(window);
     EventRecord click = {.what = mouseDown, .where = {bounds.top + 10, bounds.left + 8}};
@@ -2283,6 +2899,43 @@ static const char *SmokeQuickOpenPanel(WindowRef window)
     return NULL;
 }
 
+static const char *SmokeFinderDrop(WindowRef window, const FSSpec *note, const FSSpec *plain)
+{
+    Workspace *workspace = EditorWorkspace(GetDocument(window));
+    DragRef drag;
+    if(NewDrag(&drag) != noErr)
+        return "FAIL: create a Finder drag";
+    HFSFlavor folder = {0}, file = {.fileSpec = *plain};
+    Rect view = EditorBounds(window);
+    Point document = {view.top + 1, view.left + 1};
+    Point sidebar = {view.top + 1, 10};
+    FSSpec roots[kSettingsRootLimit];
+    unsigned before = WorkspaceCopyFolders(workspace, roots, kSettingsRootLimit);
+    Boolean attached = FSMakeFSSpec(note->vRefNum, note->parID, "\p", &folder.fileSpec) == noErr &&
+                       AddDragItemFlavor(drag, 1, kDragFlavorTypeHFS, &folder, sizeof(folder), 0) == noErr &&
+                       ProcessDrop(drag, window, NULL) == kDropFolder &&
+                       ProcessDrop(drag, window, &document) == 0 &&
+                       ProcessDrop(drag, window, &sidebar) == kDropFolder &&
+                       ProcessDrop(drag, window, &sidebar) == kDropFolder;
+    DisposeDrag(drag);
+    if(!attached || WorkspaceCopyFolders(workspace, roots, kSettingsRootLimit) != before + 1)
+        return "FAIL: dropping a folder did not attach it once, only in the sidebar";
+    if(NewDrag(&drag) != noErr)
+        return "FAIL: create a file drag";
+    Boolean opened = AddDragItemFlavor(drag, 1, kDragFlavorTypeHFS, &file, sizeof(file), 0) == noErr &&
+                     AddDragItemFlavor(drag, 1, 'TEXT', "Plain notes.txt", 15, 0) == noErr &&
+                     ProcessDrop(drag, window, &document) == kDropFile;
+    DisposeDrag(drag);
+    WindowRef dropped = FrontWindow();
+    if(!opened || dropped == window || GetDocument(dropped) == NULL ||
+       !WorkspaceHasFile(EditorWorkspace(GetDocument(dropped)), plain) ||
+       !WorkspaceHasFile(workspace, note))
+        return "FAIL: dropping a file did not open it in its own window";
+    CloseDocument(dropped);
+    SelectDocument(window);
+    return NULL;
+}
+
 static const char *SmokeQuickOpen(WindowRef window, const FSSpec *note, const FSSpec *plain)
 {
     Workspace *workspace = EditorWorkspace(GetDocument(window));
@@ -2317,6 +2970,69 @@ static const char *SmokeQuickOpen(WindowRef window, const FSSpec *note, const FS
     DispatchEvent(&click);
     if(gQuickOpen.visible || !WorkspaceHasFile(workspace, note))
         return "FAIL: clicking a Quick Open result did not open the file";
+    RefreshDocumentMenus();
+    Str255 label;
+    GetMenuItemText(gRecentMenu, 1, label);
+    if(gSettings.recentCount != 2 || !EqualString(label, note->name, true, true))
+        return "FAIL: Open Recent did not list the files in most-recent order";
+    if(!SettingsSmokeRecent(&gSettings))
+        return "FAIL: Open Recent did not survive a settings save and reload";
+    DoMenuCommand(((long)kRecentMenu << 16) | 1);
+    if(FrontWindow() != window || gSettings.recentCount != 2)
+        return "FAIL: Open Recent duplicated a document that was already open";
+    DoMenuCommand(((long)kRecentMenu << 16) | 2);
+    WindowRef recent = FrontWindow();
+    if(recent == window || GetDocument(recent) == NULL ||
+       !WorkspaceHasFile(EditorWorkspace(GetDocument(recent)), plain) ||
+       !EqualString(gSettings.recent[0].name, plain->name, true, true))
+        return "FAIL: Open Recent did not reopen the selected file";
+    CloseDocument(recent);
+    SelectWindow(window);
+    DoMenuCommand(((long)kRecentMenu << 16) | (gSettings.recentCount + 2));
+    if(gSettings.recentCount != 0)
+        return "FAIL: Clear Menu did not clear the recent files";
+    return SmokeFinderDrop(window, note, plain);
+}
+
+static const char *SmokeDocumentMenus(WindowRef window)
+{
+    MenuID submenu;
+    if(GetMenuItemHierarchicalID(GetMenu(kFileMenu), kOpenRecentItem, &submenu) != noErr ||
+       submenu != kRecentMenu)
+        return "FAIL: File menu did not attach the Open Recent submenu";
+    EventRecord key = {.what = keyDown, .modifiers = cmdKey | shiftKey, .message = 'S'};
+    UpdateMenus();
+    UInt8 modifiers;
+    if(GetMenuItemModifiers(GetMenu(kFileMenu), kSaveAsItem, &modifiers) != noErr ||
+       modifiers != kMenuShiftModifier ||
+       CommandMenuSelection(&key) != (((long)kFileMenu << 16) | kSaveAsItem))
+        return "FAIL: Command-Shift-S did not select Save As";
+    key.message = 'G';
+    if(GetMenuItemModifiers(GetMenu(kEditMenu), kFindPreviousItem, &modifiers) != noErr ||
+       modifiers != kMenuShiftModifier ||
+       CommandMenuSelection(&key) != (((long)kEditMenu << 16) | kFindPreviousItem))
+        return "FAIL: Command-Shift-G did not select Find Previous";
+    HiliteMenu(0);
+
+    WindowRef second = NewDocument(NULL);
+    if(second == NULL)
+        return "FAIL: create the second Window menu fixture";
+    RefreshDocumentMenus();
+    short mark;
+    GetItemMark(gWindowMenu, kFirstDocumentItem, &mark);
+    if(CountMenuItems(gWindowMenu) != kFirstDocumentItem + 1 || mark == 0)
+        return "FAIL: Window did not list the two documents and mark the active one";
+    DoMenuCommand(((long)kWindowMenu << 16) | (kFirstDocumentItem + 1));
+    if(FrontWindow() != window)
+        return "FAIL: Window did not select the requested document";
+    CloseDocument(second);
+    Rect normal = WindowCanvas(window);
+    DoMenuCommand(((long)kWindowMenu << 16) | kZoomItem);
+    Rect zoomed = WindowCanvas(window);
+    DoMenuCommand(((long)kWindowMenu << 16) | kZoomItem);
+    Rect restored = WindowCanvas(window);
+    if(EqualRect(&normal, &zoomed) || !EqualRect(&normal, &restored))
+        return "FAIL: Window Zoom did not enlarge and restore the document";
     return NULL;
 }
 
@@ -2328,7 +3044,7 @@ static const char *SmokeTest(WindowRef window)
         return "FAIL: could not open the editor window";
 
     if(CountMenuItems(GetMenu(kEditMenu)) != kTaskItem ||
-       CountMenuItems(GetMenu(kFileMenu)) != kQuickOpenItem)
+       CountMenuItems(GetMenu(kFileMenu)) != kQuitItem)
         return "FAIL: the File or Edit menu did not load all commands";
 
 #if TARGET_API_MAC_CARBON
@@ -2336,18 +3052,44 @@ static const char *SmokeTest(WindowRef window)
     if(GetWindowAttributes(window, &attributes) != noErr ||
        (attributes & kWindowFullZoomAttribute) != kWindowFullZoomAttribute)
         return "FAIL: the Carbon document window lacked its zoom button";
+    short zoomPart = inZoomOut;
+#else
+    SetPortWindowPort(window);
+    Point box = {-9, WindowCanvas(window).right - 8};
+    LocalToGlobal(&box);
+    short zoomPart = 0;
+    for(short x = 0; x < 48; ++x, --box.h) {
+        WindowRef hit;
+        short part = FindWindow(box, &hit);
+        if(hit == window && part == inZoomOut) {
+            zoomPart = part;
+            break;
+        }
+    }
+    if(zoomPart == 0)
+        return "FAIL: the Classic document window lacked its zoom box";
+#endif
     Rect normal = WindowCanvas(window);
-    if(ZoomDocument(window) != noErr)
-        return "FAIL: Carbon window zoom failed";
+    if(ZoomDocument(window, zoomPart) != noErr)
+        return "FAIL: document window zoom failed";
     Rect zoomed = WindowCanvas(window);
-    if(EqualRect(&normal, &zoomed) || ZoomDocument(window) != noErr)
-        return "FAIL: Carbon window zoom did not change the size or restore it";
+    if(zoomed.right <= normal.right || zoomed.bottom <= normal.bottom ||
+       ZoomDocument(window, inZoomIn) != noErr)
+        return "FAIL: document window zoom did not enlarge or restore it";
     Rect restored = WindowCanvas(window);
     if(!EqualRect(&normal, &restored))
-        return "FAIL: Carbon window zoom did not restore the original size";
-#endif
+        return "FAIL: document window zoom did not restore the original size";
 
-    const char *result = SmokeEditorInput(window, editor);
+    const char *result = SmokeDocumentMenus(window);
+    if(result != NULL)
+        return result;
+    result = SmokeTextDrop(window, editor);
+    if(result != NULL)
+        return result;
+    result = SmokeSelectionDrag(window, editor);
+    if(result != NULL)
+        return result;
+    result = SmokeEditorInput(window, editor);
     if(result != NULL)
         return result;
     result = SmokeViewModes(editor, window);
@@ -2443,12 +3185,16 @@ int main(void)
 
     SetMenuBar(GetNewMBar(128));
     InsertMenu(GetMenu(kViewMenu), 0);
+    if(!InitDocumentMenus())
+        return 1;
     UpdateThemeMenu();
 #if !TARGET_API_MAC_CARBON
     AppendResMenu(GetMenu(kAppleMenu), 'DRVR');
 #endif
     DrawMenuBar();
 
+    gTrackDrop = NewDragTrackingHandlerUPP(TrackDrop);
+    gReceiveDrop = NewDragReceiveHandlerUPP(ReceiveDrop);
     AEEventHandlerUPP openDocuments = NewAEEventHandlerUPP(OpenDocuments);
     if(openDocuments != NULL)
         AEInstallEventHandler(kCoreEventClass, kAEOpenDocuments, openDocuments, 0, false);
@@ -2525,6 +3271,10 @@ int main(void)
 #endif
             CloseDocument(window);
     }
+    if(gTrackDrop != NULL)
+        DisposeDragTrackingHandlerUPP(gTrackDrop);
+    if(gReceiveDrop != NULL)
+        DisposeDragReceiveHandlerUPP(gReceiveDrop);
     if(openDocuments != NULL) {
         AERemoveEventHandler(kCoreEventClass, kAEOpenDocuments, openDocuments, false);
         DisposeAEEventHandlerUPP(openDocuments);

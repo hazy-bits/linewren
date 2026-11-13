@@ -20,16 +20,16 @@ resource 'MENU' (129) {
     "File";
     {
         "New", noIcon, "N", noMark, plain;
+        "Open...", noIcon, "O", noMark, plain;
+        "Open Recent", noIcon, noKey, noMark, plain;
+        "Quick Open...", noIcon, "P", noMark, plain;
+        "Add Folder...", noIcon, noKey, noMark, plain;
         "-", noIcon, noKey, noMark, plain;
         "Close", noIcon, "W", noMark, plain;
-        "Quit", noIcon, "Q", noMark, plain;
-        "-", noIcon, noKey, noMark, plain;
-        "Open...", noIcon, "O", noMark, plain;
-        "Add Folder...", noIcon, noKey, noMark, plain;
         "Save", noIcon, "S", noMark, plain;
-        "Save As...", noIcon, noKey, noMark, plain;
+        "Save As...", noIcon, "S", noMark, plain;
         "-", noIcon, noKey, noMark, plain;
-        "Quick Open...", noIcon, "P", noMark, plain;
+        "Quit", noIcon, "Q", noMark, plain;
     }
 };
 
@@ -39,7 +39,7 @@ resource 'MENU' (130) {
     "Edit";
     {
         "Undo", noIcon, "Z", noMark, plain;
-        "Redo", noIcon, noKey, noMark, plain;
+        "Redo", noIcon, "Z", noMark, plain;
         "Cut", noIcon, "X", noMark, plain;
         "Copy", noIcon, "C", noMark, plain;
         "Paste", noIcon, "V", noMark, plain;
@@ -51,6 +51,7 @@ resource 'MENU' (130) {
         "-", noIcon, noKey, noMark, plain;
         "Find...", noIcon, "F", noMark, plain;
         "Find Next", noIcon, "G", noMark, plain;
+        "Find Previous", noIcon, "G", noMark, plain;
         "Replace...", noIcon, noKey, noMark, plain;
         "-", noIcon, noKey, noMark, plain;
         "Link", noIcon, "K", noMark, plain;
@@ -111,6 +112,16 @@ resource 'MENU' (136) {
 
 resource 'MBAR' (128) {
     { 128, 129, 130 };
+};
+
+resource 'MENU' (137) {
+    137, textMenuProc;
+    allEnabled, enabled;
+    "Window";
+    {
+        "Zoom", noIcon, noKey, noMark, plain;
+        "-", noIcon, noKey, noMark, plain;
+    }
 };
 
 resource 'WIND' (128) {
