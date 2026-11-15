@@ -6,8 +6,6 @@ folders of ordinary UTF-8 files.
 
 <a href="site/assets/linewren-light.png?raw=true"><img src="site/assets/linewren-light.png" width="662" alt="Linewren in light mode on Mac OS 9"></a>
 
-[View the original 1324 × 699 screenshot](site/assets/linewren-light.png?raw=true)
-
 ## Get Linewren
 
 | System | Release file | Install |
