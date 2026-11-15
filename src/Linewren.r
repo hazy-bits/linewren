@@ -1,5 +1,6 @@
 #include "Processes.r"
 #include "Dialogs.r"
+#include "Controls.r"
 #include "Menus.r"
 #include "Windows.r"
 #include "MacTypes.r"
@@ -28,6 +29,9 @@ resource 'MENU' (129) {
         "Close", noIcon, "W", noMark, plain;
         "Save", noIcon, "S", noMark, plain;
         "Save As...", noIcon, "S", noMark, plain;
+        "-", noIcon, noKey, noMark, plain;
+        "Open as MacRoman...", noIcon, noKey, noMark, plain;
+        "Reload from Disk", noIcon, noKey, noMark, plain;
         "-", noIcon, noKey, noMark, plain;
         "Quit", noIcon, "Q", noMark, plain;
     }
@@ -59,6 +63,19 @@ resource 'MENU' (130) {
         "Quote", noIcon, noKey, noMark, plain;
         "List", noIcon, noKey, noMark, plain;
         "Task", noIcon, noKey, noMark, plain;
+        "-", noIcon, noKey, noMark, plain;
+        "Spelling", noIcon, noKey, noMark, plain;
+    }
+};
+
+resource 'MENU' (139) {
+    139, textMenuProc;
+    allEnabled, enabled;
+    "Spelling";
+    {
+        "Spelling...", noIcon, ":", noMark, plain;
+        "Check Spelling", noIcon, ";", noMark, plain;
+        "Check Spelling as You Type", noIcon, noKey, noMark, plain;
     }
 };
 
@@ -165,9 +182,19 @@ resource 'DITL' (130) {
         {80, 242, 101, 324}, Button { enabled, "Create" };
         {80, 148, 101, 230}, Button { enabled, "Cancel" };
         {16, 16, 34, 324}, StaticText { disabled, "Name the new Markdown file:" };
+#if TARGET_API_MAC_CARBON
         {43, 18, 63, 322}, EditText { enabled, "Untitled.md" };
+#else
+        {43, 18, 63, 322}, Control { enabled, 135 };
+#endif
     }
 };
+
+#if !TARGET_API_MAC_CARBON
+resource 'CNTL' (135) {
+    {43, 18, 63, 322}, 0, visible, 0, 0, 272, 0, "";
+};
+#endif
 
 resource 'ALRT' (131) {
     {85, 85, 205, 447}, 131,
@@ -181,6 +208,23 @@ resource 'DITL' (131) {
         {83, 166, 104, 244}, Button { enabled, "Cancel" };
         {83, 254, 104, 345}, Button { enabled, "Delete" };
         {14, 62, 68, 344}, StaticText { disabled, "Delete ^0 by moving it to the Trash?" };
+    }
+};
+
+resource 'ALRT' (132) {
+    {85, 85, 205, 467}, 132,
+    { Cancel, visible, silent; Cancel, visible, silent;
+      Cancel, visible, silent; Cancel, visible, silent; };
+    centerMainScreen;
+};
+
+resource 'DITL' (132) {
+    {
+        {83, 265, 104, 365}, Button { enabled, "Save As..." };
+        {83, 175, 104, 254}, Button { enabled, "Cancel" };
+        {83, 18, 104, 159}, Button { enabled, "Discard and Reload" };
+        {14, 62, 68, 365}, StaticText { disabled,
+            "Reloading replaces your unsaved edits with the file on disk. Use Save As to keep your edits in a separate file." };
     }
 };
 
@@ -201,6 +245,44 @@ resource 'SIZE' (-1) {
     reserved,
     reserved,
     reserved,
+#if TARGET_API_MAC_CARBON
     2048 * 1024,
+#else
+    8192 * 1024,
+#endif
     384 * 1024
+};
+
+resource 'DLOG' (133) {
+    {90, 90, 337, 509}, movableDBoxProc;
+    invisible, noGoAway, 0, 133, "Spelling";
+    centerMainScreen;
+};
+
+resource 'dlgx' (133) {
+    versionZero { kDialogFlagsUseThemeBackground | kDialogFlagsUseControlHierarchy |
+                  kDialogFlagsHandleMovableModal | kDialogFlagsUseThemeControls }
+};
+
+resource 'DITL' (133) {
+    {
+        {18, 299, 40, 401}, Button { enabled, "Change" };
+        {210, 299, 232, 401}, Button { enabled, "Done" };
+        {52, 299, 74, 401}, Button { enabled, "Find Next" };
+        {86, 299, 108, 401}, Button { enabled, "Ignore" };
+        {35, 18, 55, 280}, Control { disabled, 134 };
+        {83, 18, 199, 280}, Control { enabled, 133 };
+        {16, 18, 34, 280}, StaticText { disabled, "Misspelled word" };
+        {62, 18, 81, 280}, StaticText { disabled, "Suggestions" };
+        {210, 84, 232, 280}, Button { enabled, "Language" };
+        {213, 18, 232, 82}, StaticText { disabled, "Language" };
+    }
+};
+
+resource 'CNTL' (133) {
+    {83, 18, 199, 280}, 0, visible, 0, 0, 352, 0, "";
+};
+
+resource 'CNTL' (134) {
+    {35, 18, 55, 280}, 0, visible, 0, 0, 288, 0, "";
 };

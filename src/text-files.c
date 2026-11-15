@@ -1,7 +1,9 @@
 #include "text-files.h"
 
 #include <Memory.h>
+#include <Script.h>
 #include <OSUtils.h>
+#include <UnicodeConverter.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -22,7 +24,7 @@ OSErr ReadTextFile(const FSSpec *file, Handle *bytes)
         return error;
     error = GetEOF(ref, &length);
     if(error == noErr && length > kTextFileLimit)
-        error = memFullErr;
+        error = kTextTooLargeErr;
     if(error == noErr) {
         *bytes = NewHandle(length);
         if(*bytes == NULL)
@@ -43,7 +45,7 @@ OSErr ReadTextFile(const FSSpec *file, Handle *bytes)
     return error;
 }
 
-OSErr DecodeTextFile(Handle bytes, Handle *text)
+OSErr DecodeTextWithFormat(Handle bytes, Handle *text, TextFileFormat *format)
 {
     long length = GetHandleSize(bytes), used = 0;
     *text = NewHandle(length * sizeof(uint16_t));
@@ -52,12 +54,33 @@ OSErr DecodeTextFile(Handle bytes, Handle *text)
 
     const uint8_t *input = (const uint8_t *)*bytes;
     uint16_t *output = (uint16_t *)**text;
-    long i = length >= 3 && memcmp(input, "\xef\xbb\xbf", 3) == 0 ? 3 : 0;
+    format->bom = !format->macRoman && length >= 3 && memcmp(input, "\xef\xbb\xbf", 3) == 0;
+    format->endings = kTextLF;
+    Boolean sawEnding = false;
+    long i = format->bom ? 3 : 0;
+    if(format->macRoman && length != 0) {
+        TextToUnicodeInfo converter;
+        OSStatus status = CreateTextToUnicodeInfoByEncoding(kTextEncodingMacRoman, &converter);
+        if(status != noErr)
+            goto invalid;
+        ByteCount read, written;
+        HLock(bytes);
+        HLock(*text);
+        status = ConvertFromTextToUnicode(converter, length, *bytes, 0, 0, NULL, NULL, NULL,
+                                          length * sizeof(*output), &read, &written, (UniChar *)**text);
+        DisposeTextToUnicodeInfo(&converter);
+        HUnlock(*text);
+        HUnlock(bytes);
+        if(status != noErr || read != length)
+            goto invalid;
+        output = (uint16_t *)**text;
+        length = written / sizeof(*output);
+    }
     while(i < length) {
-        uint32_t code = input[i++];
+        uint32_t code = format->macRoman ? output[i++] : input[i++];
         unsigned extra;
         uint32_t minimum;
-        if(code < 0x80) {
+        if(format->macRoman || code < 0x80) {
             extra = 0;
             minimum = 0;
         } else if(code >= 0xc2 && code <= 0xdf) {
@@ -82,8 +105,18 @@ OSErr DecodeTextFile(Handle bytes, Handle *text)
         }
         if(code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) || code == 0)
             goto invalid;
-        if(code == '\r' && i < length && input[i] == '\n')
-            ++i;
+        if(code == '\r' || code == '\n') {
+            TextLineEnding ending = code == '\r' ? kTextCR : kTextLF;
+            if(code == '\r' && i < length && (format->macRoman ? output[i] : input[i]) == '\n') {
+                ending = kTextCRLF;
+                ++i;
+            }
+            if(!sawEnding)
+                format->endings = ending;
+            else if(format->endings != ending)
+                format->endings = kTextMixed;
+            sawEnding = true;
+        }
         if(code <= 0xffff) {
             output[used++] = code == '\n' ? '\r' : (uint16_t)code;
         } else {
@@ -105,17 +138,79 @@ invalid:
     return kTextMalformedInputErr;
 }
 
-OSErr EncodeTextUTF8(const uint16_t *input, unsigned length, Handle *bytes)
+OSErr DecodeTextFile(Handle bytes, Handle *text)
 {
-    long used = 0;
-    unsigned capacity = length * 3 < kTextFileLimit ? length * 3 : kTextFileLimit;
+    TextFileFormat format = {0};
+    return DecodeTextWithFormat(bytes, text, &format);
+}
+
+OSErr EncodeTextWithFormat(const uint16_t *input, unsigned length, TextFileFormat format, Handle *bytes)
+{
+    long used = format.bom && !format.macRoman ? 3 : 0;
     *bytes = NULL;
     if(length > kTextFileLimit)
-        return memFullErr;
+        return kTextTooLargeErr;
+    if(format.endings == kTextMixed)
+        return kTextMixedEndingsErr;
+    unsigned capacity = length * 3 + used;
+    if(capacity > kTextFileLimit)
+        capacity = kTextFileLimit;
     *bytes = NewHandle(capacity);
     if(*bytes == NULL)
         return memFullErr;
     uint8_t *output = (uint8_t *)**bytes;
+    if(used != 0)
+        memcpy(output, "\xef\xbb\xbf", 3);
+    /* Convert the legacy encoding, then restore the file's line endings. */
+    if(format.macRoman) {
+        UnicodeToTextInfo converter;
+        OSStatus status = CreateUnicodeToTextInfoByEncoding(kTextEncodingMacRoman, &converter);
+        if(status != noErr) {
+            DisposeHandle(*bytes);
+            *bytes = NULL;
+            return status;
+        }
+        ByteCount read = 0, written = 0;
+        HLock(*bytes);
+        if(length != 0)
+            status = ConvertFromUnicodeToText(converter, length * sizeof(*input), input,
+                                              0, 0, NULL, NULL, NULL, capacity, &read, &written, **bytes);
+        DisposeUnicodeToTextInfo(&converter);
+        output = (uint8_t *)**bytes;
+        if(status == noErr && read == length * sizeof(*input)) {
+            used = written;
+            if(format.endings == kTextCRLF) {
+                for(ByteCount j = 0; j < written; ++j)
+                    used += output[j] == '\r';
+                if(used > capacity) {
+                    status = kTextTooLargeErr;
+                } else {
+                    for(long at = used; written != 0;) {
+                        uint8_t ch = output[--written];
+                        if(ch == '\r')
+                            output[--at] = '\n';
+                        output[--at] = ch;
+                    }
+                }
+            } else if(format.endings == kTextLF) {
+                for(long j = 0; j < used; ++j)
+                    if(output[j] == '\r')
+                        output[j] = '\n';
+            }
+        } else {
+            status = kTextUnsupportedEncodingErr;
+        }
+        HUnlock(*bytes);
+        if(status == noErr) {
+            SetHandleSize(*bytes, used);
+            status = MemError();
+        }
+        if(status != noErr) {
+            DisposeHandle(*bytes);
+            *bytes = NULL;
+        }
+        return status;
+    }
     unsigned i;
     for(i = 0; i < length; ++i) {
         uint32_t code = input[i];
@@ -130,10 +225,14 @@ OSErr EncodeTextUTF8(const uint16_t *input, unsigned length, Handle *bytes)
             return kTextMalformedInputErr;
         }
         unsigned width = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+        if(code == '\r' && format.endings == kTextCRLF)
+            width = 2;
         if(used + width > capacity)
             break;
         if(code < 0x80) {
-            output[used++] = code == '\r' ? '\n' : (uint8_t)code;
+            output[used++] = code == '\r' && format.endings == kTextLF ? '\n' : (uint8_t)code;
+            if(width == 2)
+                output[used++] = '\n';
             continue;
         }
         if(code >= 0x10000) {
@@ -152,7 +251,12 @@ OSErr EncodeTextUTF8(const uint16_t *input, unsigned length, Handle *bytes)
     }
     DisposeHandle(*bytes);
     *bytes = NULL;
-    return memFullErr;
+    return i == length ? memFullErr : kTextTooLargeErr;
+}
+
+OSErr EncodeTextUTF8(const uint16_t *input, unsigned length, Handle *bytes)
+{
+    return EncodeTextWithFormat(input, length, (TextFileFormat){0}, bytes);
 }
 
 static OSErr CopyResourceFork(const FSSpec *from, const FSSpec *to)
@@ -185,8 +289,47 @@ static OSErr CopyResourceFork(const FSSpec *from, const FSSpec *to)
     return error == noErr ? closeError : error;
 }
 
-OSErr WriteTextFile(const FSSpec *file, Handle bytes, Handle expected)
+#if !TARGET_API_MAC_CARBON
+OSErr RenameClassicFile(FSSpec *file, ConstStr255Param name, ScriptCode script)
 {
+    if(script != smCyrillic) {
+        OSErr error = FSpRename(file, name);
+        if(error == noErr)
+            memcpy(file->name, name, name[0] + 1);
+        return error;
+    }
+    FSRef original, renamed;
+    OSErr error = FSpMakeFSRef(file, &original);
+    if(error != noErr)
+        return error;
+    TextToUnicodeInfo converter;
+    error = CreateTextToUnicodeInfoByEncoding(kTextEncodingMacCyrillic, &converter);
+    if(error != noErr)
+        return error;
+    UniChar text[63];
+    ByteCount read, written;
+    error = ConvertFromTextToUnicode(converter, name[0], (const char *)name + 1, 0,
+        0, NULL, NULL, NULL, sizeof(text), &read, &written, text);
+    DisposeTextToUnicodeInfo(&converter);
+    if(error == noErr)
+        error = FSRenameUnicode(&original, written / sizeof(*text), text,
+                                kTextEncodingMacCyrillic, &renamed);
+    if(error == noErr) {
+        FSSpec result;
+        error = FSGetCatalogInfo(&renamed, kFSCatInfoNone, NULL, NULL, &result, NULL);
+        if(error == noErr)
+            *file = result;
+    }
+    return error;
+}
+#endif
+
+static OSErr WriteFile(const FSSpec *file, Handle bytes, Handle expected,
+                       ScriptCode script, FSSpec *created)
+{
+#if TARGET_API_MAC_CARBON
+    (void)script;
+#endif
     FSSpec temp = *file;
     unsigned long serial = TickCount();
     OSErr error = dupFNErr;
@@ -230,11 +373,37 @@ OSErr WriteTextFile(const FSSpec *file, Handle bytes, Handle expected)
     }
     if(error == noErr)
         error = FlushVol(NULL, file->vRefNum);
-    if(error == noErr)
-        error = expected == NULL ? FSpRename(&temp, file->name) : FSpExchangeFiles(file, &temp);
+    if(error == noErr) {
+        if(expected != NULL)
+            error = FSpExchangeFiles(file, &temp);
+#if !TARGET_API_MAC_CARBON
+        else if(script == smCyrillic)
+            error = RenameClassicFile(&temp, file->name, script);
+#endif
+        else {
+            error = FSpRename(&temp, file->name);
+            if(error == noErr)
+                memcpy(temp.name, file->name, file->name[0] + 1);
+        }
+    }
+    if(error == noErr && created != NULL)
+        *created = temp;
     if(error != noErr || expected != NULL)
         FSpDelete(&temp);
     if(error == noErr)
         FlushVol(NULL, file->vRefNum);
     return error;
 }
+
+
+OSErr WriteTextFile(const FSSpec *file, Handle bytes, Handle expected)
+{
+    return WriteFile(file, bytes, expected, smRoman, NULL);
+}
+
+#if !TARGET_API_MAC_CARBON
+OSErr CreateClassicTextFile(FSSpec *file, Handle bytes, ScriptCode script)
+{
+    return WriteFile(file, bytes, NULL, script, file);
+}
+#endif

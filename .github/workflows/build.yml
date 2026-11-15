@@ -72,6 +72,7 @@ jobs:
       - name: Run host tests and compile both guest smoke suites
         run: |
           ./scripts/test-local.sh
+          python3 tests/compact-dictionary-test.py
           nix build .#powerpc-smoke .#powerpc-osx-smoke --no-link
       - name: Build and verify the release archives
         run: ./scripts/package-release.sh release

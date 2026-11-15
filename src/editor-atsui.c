@@ -9,16 +9,26 @@
 #include <Controls.h>
 #include <ControlDefinitions.h>
 #include <Fonts.h>
+#include <Dialogs.h>
 #if TARGET_API_MAC_CARBON
+#include "spelling.h"
 #include <Gestalt.h>
+#else
+#include "classic-spelling.h"
 #endif
 #include <InternetConfig.h>
+#include <Lists.h>
 #include <Memory.h>
 #include <OSUtils.h>
 #include <QDOffscreen.h>
 #include <Scrap.h>
+#if !TARGET_API_MAC_CARBON
+#include <Script.h>
+#endif
 #include <Sound.h>
+#include <TextEdit.h>
 #include <UnicodeConverter.h>
+#include <UnicodeUtilities.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,8 +66,23 @@ typedef struct {
     unsigned count, bytes;
 } EditHistory;
 
+typedef struct { unsigned start, end; } SpellingMark;
+
+typedef struct IgnoredWord {
+    struct IgnoredWord *next;
+    unsigned length;
+    UniChar text[];
+} IgnoredWord;
+
+enum { kSuggestionCount = 6, kSuggestionLength = 100 };
+typedef struct {
+    unsigned length;
+    UniChar text[kSuggestionLength];
+} SpellingSuggestion;
+
 struct Editor {
     Workspace *workspace;
+    WindowRef window;
     Handle source;
     unsigned length, utf8Length, styleCapacity;
     uint16_t *styles;
@@ -92,6 +117,16 @@ struct Editor {
     unsigned reuseSplits[kMaxSplits];
     LayoutSpan paragraph;
     OSStatus layoutError;
+    SpellingMark *spellingMarks;
+    unsigned spellingCount;
+    Boolean spellingChecked, liveSpelling, spellingPending;
+    unsigned long spellingAt;
+    IgnoredWord *ignoredWords;
+#if TARGET_API_MAC_CARBON
+    CFStringRef spellingLanguage;
+#else
+    ClassicSpellingLanguage spellingLanguage;
+#endif
 };
 
 #ifdef LINEWREN_SMOKE_TEST
@@ -104,6 +139,10 @@ static unsigned gCapturedWebLength;
 static short gDefaultFamily;
 static ATSUFontID gDefaultFont;
 static TextToUnicodeInfo gFromRoman;
+#if !TARGET_API_MAC_CARBON
+static TextToUnicodeInfo gFromCyrillic;
+static UnicodeToTextInfo gToCyrillic;
+#endif
 static UnicodeToTextInfo gToRoman;
 static void RefreshStyles(Editor *editor, Boolean immediate);
 static void ShowCaret(Editor *editor);
@@ -129,6 +168,13 @@ Boolean EditorInit(void)
 
 void EditorShutdown(void)
 {
+#if !TARGET_API_MAC_CARBON
+    ClassicSpellingUnload();
+    if(gFromCyrillic != NULL)
+        DisposeTextToUnicodeInfo(&gFromCyrillic);
+    if(gToCyrillic != NULL)
+        DisposeUnicodeToTextInfo(&gToCyrillic);
+#endif
     if(gFromRoman != NULL)
         DisposeTextToUnicodeInfo(&gFromRoman);
     if(gToRoman != NULL)
@@ -263,6 +309,7 @@ Editor *EditorNew(WindowRef window, const Rect *view, OSStatus *status)
         *status = memFullErr;
         return NULL;
     }
+    editor->window = window;
     editor->view = *view;
     editor->markdown = true;
     editor->typography = EditorDefaultTypography();
@@ -285,8 +332,30 @@ Editor *EditorNew(WindowRef window, const Rect *view, OSStatus *status)
     return editor;
 }
 
+static void ClearSpelling(Editor *editor)
+{
+    free(editor->spellingMarks);
+    editor->spellingMarks = NULL;
+    editor->spellingCount = 0;
+}
+
+static void ClearIgnoredWords(Editor *editor)
+{
+    while(editor->ignoredWords != NULL) {
+        IgnoredWord *word = editor->ignoredWords;
+        editor->ignoredWords = word->next;
+        free(word);
+    }
+}
+
 void EditorDelete(Editor *editor)
 {
+#if TARGET_API_MAC_CARBON
+    if(editor->spellingLanguage != NULL)
+        CFRelease(editor->spellingLanguage);
+#endif
+    ClearSpelling(editor);
+    ClearIgnoredWords(editor);
     DropStyles(editor);
     if(editor->source != NULL)
         DisposeHandle(editor->source);
@@ -336,7 +405,16 @@ static unsigned UTF8Length(const UniChar *source, unsigned length)
 
 OSStatus EditorEncodeText(Editor *editor, Handle *bytes)
 {
-    return EncodeTextUTF8(Source(editor), editor->length, bytes);
+    return EditorEncodeFile(editor, (TextFileFormat){0}, bytes);
+}
+
+OSStatus EditorEncodeFile(Editor *editor, TextFileFormat format, Handle *bytes)
+{
+    SignedByte state = HGetState(editor->source);
+    HLock(editor->source);
+    OSErr error = EncodeTextWithFormat(Source(editor), editor->length, format, bytes);
+    HSetState(editor->source, state);
+    return error;
 }
 
 static uint16_t *DocumentStyles(Editor *editor, const UniChar *text, unsigned length,
@@ -374,7 +452,12 @@ OSStatus EditorTakeDocument(Editor *editor, Handle text, Boolean markdown)
         HUnlock(text);
         return memFullErr;
     }
+    ClearSpelling(editor);
+    ClearIgnoredWords(editor);
     DisposeLayout(&editor->paragraph);
+    editor->spellingChecked = false;
+    editor->spellingPending = editor->liveSpelling && length != 0;
+    editor->spellingAt = TickCount();
     if(editor->source != NULL)
         DisposeHandle(editor->source);
     free(editor->styles);
@@ -413,6 +496,13 @@ void EditorSetMarkdown(Editor *editor, Boolean markdown)
     editor->stylePending = true;
     editor->styleAt = 0;
     RefreshStyles(editor, true);
+}
+
+static void InvalidateCounter(const Editor *editor)
+{
+    Rect footer = WindowCanvas(editor->window);
+    footer.top = footer.bottom - 23;
+    InvalidateRect(&footer);
 }
 
 size_t EditorWordCount(Editor *editor)
@@ -958,6 +1048,45 @@ static void PaintSelection(Editor *editor, LayoutSpan *span, Position row, Fixed
     }
 }
 
+/* First mark whose end is after the offset, or spellingCount. */
+static unsigned SpellingMarkAt(const Editor *editor, unsigned offset)
+{
+    unsigned first = 0, end = editor->spellingCount;
+    while(first < end) {
+        unsigned middle = first + (end - first) / 2;
+        if(editor->spellingMarks[middle].end <= offset)
+            first = middle + 1;
+        else
+            end = middle;
+    }
+    return first;
+}
+
+static void PaintSpelling(Editor *editor, LayoutSpan *span, Position row, Fixed x, short y)
+{
+    if(editor->spellingCount == 0 || span->length == 0)
+        return;
+    unsigned first = row.start + LineOffset(span, row.line);
+    unsigned end = row.start + span->breaks[row.line];
+    RGBColor ink = editor->theme->page.red < 0x8000
+        ? (RGBColor){0xa6a6, 0x6767, 0x6767}
+        : (RGBColor){0xa6a6, 0x5858, 0x5858};
+    for(unsigned i = SpellingMarkAt(editor, first); i < editor->spellingCount; ++i) {
+        SpellingMark mark = editor->spellingMarks[i];
+        if(mark.start >= end)
+            break;
+        unsigned left = mark.start > first ? mark.start : first;
+        unsigned right = mark.end < end ? mark.end : end;
+        short from = (x + CaretX(span, row.line, left - row.start)) >> 16;
+        short to = (x + CaretX(span, row.line, right - row.start)) >> 16;
+        RGBForeColor(&ink);
+        for(short pixel = from; pixel < to; pixel += 3) {
+            Rect dot = {y, pixel, y + 1, pixel + 1};
+            PaintRect(&dot);
+        }
+    }
+}
+
 static Boolean PaintText(Editor *editor, const Rect *text)
 {
     editor->layoutError = noErr;
@@ -986,6 +1115,7 @@ static Boolean PaintText(Editor *editor, const Rect *text)
                 break;
             }
         }
+        PaintSpelling(editor, paragraph, position, x, baseline + 2);
         if(editor->active && !selection)
             PaintSelection(editor, paragraph, position, x, baseline);
         more = Step(editor, &position, true);
@@ -1471,6 +1601,23 @@ static unsigned WordEdge(Editor *editor, unsigned offset, Boolean forward)
     return edge;
 }
 
+static unsigned ParagraphEdge(Editor *editor, unsigned offset, Boolean forward)
+{
+    const UniChar *text = Source(editor);
+    if(forward) {
+        if(offset < editor->length && text[offset] == '\r')
+            ++offset;
+        while(offset < editor->length && text[offset] != '\r')
+            ++offset;
+    } else {
+        if(offset != 0 && text[offset - 1] == '\r')
+            --offset;
+        while(offset != 0 && text[offset - 1] != '\r')
+            --offset;
+    }
+    return offset;
+}
+
 static Boolean Reserve(Editor *editor, unsigned needed)
 {
     unsigned capacity = (needed + 1023) & ~1023u;
@@ -1583,6 +1730,24 @@ static Boolean Splice(Editor *editor, unsigned start, unsigned end, const UniCha
         return false;
     }
 
+    if(editor->liveSpelling) {
+        unsigned retained = 0;
+        long delta = (long)count - removed;
+        for(unsigned i = 0; i < editor->spellingCount; ++i) {
+            SpellingMark mark = editor->spellingMarks[i];
+            if(mark.end < start) {
+                editor->spellingMarks[retained++] = mark;
+            } else if(mark.start > end) {
+                editor->spellingMarks[retained++] =
+                    (SpellingMark){mark.start + delta, mark.end + delta};
+            }
+        }
+        editor->spellingCount = retained;
+        editor->spellingPending = true;
+        editor->spellingAt = TickCount();
+    } else {
+        ClearSpelling(editor);
+    }
     unsigned top = SourceOffset(editor, editor->top);
     AdjustSplits(editor, start, end, count);
     DisposeLayout(&editor->paragraph);
@@ -1617,6 +1782,7 @@ static Boolean Splice(Editor *editor, unsigned start, unsigned end, const UniCha
     editor->styleAt = TickCount();
     editor->stylePending = true;
     WorkspaceEdited(editor->workspace);
+    InvalidateCounter(editor);
     Select(editor, caret, false, false);
     editor->typing = typing;
     editor->typedAt = now;
@@ -1664,13 +1830,31 @@ static OSStatus FromRoman(const char *input, ByteCount length, UniChar *out, Byt
                                     length * sizeof(UniChar), &read, bytes, out);
 }
 
-static unsigned SearchText(ConstStr255Param input, UniChar *text)
+unsigned EditorDecodeRoman(const char *input, unsigned length, UniChar *text)
 {
-    if(input[0] == 0)
-        return 0;
     ByteCount bytes = 0;
-    return FromRoman((const char *)input + 1, input[0], text, &bytes) == noErr
+    return length != 0 && FromRoman(input, length, text, &bytes) == noErr
         ? bytes / sizeof(*text) : 0;
+}
+
+Boolean EditorDecodeKey(unsigned char key, UniChar *character)
+{
+    if(key < 0x80) {
+        *character = key;
+        return true;
+    }
+#if !TARGET_API_MAC_CARBON
+    if(GetScriptManagerVariable(smKeyScript) == smCyrillic) {
+        if(gFromCyrillic == NULL &&
+           CreateTextToUnicodeInfoByEncoding(kTextEncodingMacCyrillic, &gFromCyrillic) != noErr)
+            return false;
+        ByteCount read, written;
+        return ConvertFromTextToUnicode(gFromCyrillic, 1, (const char *)&key, 0, 0, NULL,
+            NULL, NULL, sizeof(*character), &read, &written, character) == noErr &&
+            written == sizeof(*character);
+    }
+#endif
+    return EditorDecodeRoman((const char *)&key, 1, character) == 1;
 }
 
 static UniChar FoldSearch(UniChar ch)
@@ -1752,32 +1936,194 @@ static void OpenTextLookup(const UniChar *text, unsigned length, Boolean diction
     OpenWebURL(url, size);
 }
 
-static Boolean FindQuery(const UniChar *text, unsigned length, Str255 query)
+static Boolean FindQuery(const UniChar *text, unsigned length, SearchField *query)
 {
-    if(length == 0 || length > 255)
+    if(length == 0 || length > kSearchFieldLimit)
         return false;
     for(unsigned i = 0; i < length; ++i)
         if(text[i] == '\r' || text[i] == '\n')
             return false;
-    Str255 candidate;
-    ByteCount read, written;
-    if(ConvertFromUnicodeToText(gToRoman, length * sizeof(*text), text, 0,
-                               0, NULL, NULL, NULL, 255, &read, &written,
-                               candidate + 1) != noErr || read != length * sizeof(*text))
-        return false;
-    candidate[0] = written;
-    memcpy(query, candidate, written + 1);
-    return written != 0;
+    memcpy(query->text, text, length * sizeof(*text));
+    query->length = length;
+    return true;
 }
 
-Boolean EditorFindSelection(const Editor *editor, Str255 query)
+Boolean EditorFindSelection(const Editor *editor, SearchField *query)
 {
     unsigned start, end;
     SelectionRange(editor, &start, &end);
     return start != end && FindQuery(Source(editor) + start, end - start, query);
 }
 
-Boolean EditorContextMenu(Editor *editor, Point point, Str255 find)
+static unsigned SpellingAtPoint(Editor *editor, Point point)
+{
+    Position row;
+    short top;
+    if(editor->spellingCount == 0 || !RowAtPoint(editor, point, &row, &top))
+        return editor->spellingCount;
+    LayoutSpan *span = Layout(editor, row.start);
+    if(span == NULL || span->length == 0)
+        return editor->spellingCount;
+    unsigned first = row.start + LineOffset(span, row.line);
+    unsigned end = row.start + span->breaks[row.line];
+    Fixed x = (Fixed)(point.h - TextBounds(editor).left) * 65536;
+    for(unsigned i = SpellingMarkAt(editor, first); i < editor->spellingCount; ++i) {
+        SpellingMark mark = editor->spellingMarks[i];
+        if(mark.start >= end)
+            break;
+        unsigned left = mark.start > first ? mark.start : first;
+        unsigned right = mark.end < end ? mark.end : end;
+        if(x >= CaretX(span, row.line, left - row.start) &&
+           x < CaretX(span, row.line, right - row.start))
+            return i;
+    }
+    return editor->spellingCount;
+}
+
+static Boolean CorrectSpelling(Editor *editor, unsigned index, const SpellingSuggestion *replacement)
+{
+    unsigned length = replacement->length;
+    SpellingMark *marks = editor->spellingMarks;
+    SpellingMark mark = marks[index];
+    unsigned count = editor->spellingCount;
+    editor->spellingMarks = NULL;
+    editor->spellingCount = 0;
+    Boolean changed = ReplaceRange(editor, mark.start, mark.end, replacement->text, length,
+                                   mark.start + length, true);
+    if(changed) {
+        long delta = (long)length - (mark.end - mark.start);
+        --count;
+        for(unsigned i = index; i < count; ++i)
+            marks[i] = (SpellingMark){marks[i + 1].start + delta, marks[i + 1].end + delta};
+    }
+    editor->spellingMarks = marks;
+    editor->spellingCount = count;
+    return changed;
+}
+
+static Boolean IsIgnoredWord(const Editor *editor, const UniChar *text, unsigned length)
+{
+    for(const IgnoredWord *word = editor->ignoredWords; word != NULL; word = word->next)
+        if(word->length == length && EditorUnicodeEqual(word->text, text, length))
+            return true;
+    return false;
+}
+
+static void IgnoreSpelling(Editor *editor, unsigned index)
+{
+    SpellingMark mark = editor->spellingMarks[index];
+    unsigned length = mark.end - mark.start;
+    const UniChar *source = Source(editor);
+    IgnoredWord *word = malloc(sizeof(*word) + length * sizeof(*source));
+    if(word == NULL) {
+        SysBeep(1);
+        return;
+    }
+    word->next = editor->ignoredWords;
+    word->length = length;
+    memcpy(word->text, source + mark.start, length * sizeof(*source));
+    editor->ignoredWords = word;
+
+    unsigned count = 0;
+    for(unsigned i = 0; i < editor->spellingCount; ++i) {
+        SpellingMark current = editor->spellingMarks[i];
+        if(current.end - current.start != length ||
+           !EditorUnicodeEqual(word->text, source + current.start, length))
+            editor->spellingMarks[count++] = current;
+    }
+    editor->spellingCount = count;
+    InvalidateWritingSurface(editor);
+}
+
+static unsigned SuggestionsForMark(Editor *editor, unsigned index,
+                                   SpellingSuggestion suggestions[kSuggestionCount])
+{
+    SpellingMark mark = editor->spellingMarks[index];
+    const UniChar *source = Source(editor);
+    unsigned count = 0;
+#if TARGET_API_MAC_CARBON
+    CFStringRef word = CFStringCreateWithCharacters(NULL, source + mark.start,
+                                                    mark.end - mark.start);
+    if(word == NULL)
+        return 0;
+    CFArrayRef guesses = SpellingSuggestions(word, EditorSpellingLanguage(editor));
+    CFRelease(word);
+    if(guesses == NULL)
+        return 0;
+    for(CFIndex i = 0; i < CFArrayGetCount(guesses) && count < kSuggestionCount; ++i) {
+        CFStringRef guess = CFArrayGetValueAtIndex(guesses, i);
+        CFIndex length = CFStringGetLength(guess);
+        if(length > 0 && length <= kSuggestionLength) {
+            CFStringGetCharacters(guess, CFRangeMake(0, length), suggestions[count].text);
+            suggestions[count++].length = length;
+        }
+    }
+    CFRelease(guesses);
+#else
+    char word[kSpellingWordSize], guesses[kSpellingSuggestions][kSpellingWordSize];
+    unsigned offset = mark.start, start;
+    ClassicSpellingLanguage language = editor->spellingLanguage;
+    if(ClassicSpellingWord(language, source, mark.end, &offset, &start, word) &&
+       ClassicSpellingLoad(language)) {
+        unsigned found = ClassicSpellingSuggest(word, guesses);
+        for(unsigned i = 0; i < found && count < kSuggestionCount; ++i) {
+            unsigned length = strlen(guesses[i]);
+            if(length == 0 || length > kSuggestionLength)
+                continue;
+            for(unsigned j = 0; j < length; ++j)
+                suggestions[count].text[j] = ClassicSpellingDecode(language, (unsigned char)guesses[i][j]);
+            suggestions[count++].length = length;
+        }
+    }
+#endif
+    return count;
+}
+
+#if !TARGET_API_MAC_CARBON
+static short SpellingFont(ClassicSpellingLanguage language)
+{
+    return language == kSpellingRussian ? GetScriptVariable(smCyrillic, smScriptSysFond) : 0;
+}
+
+static UnicodeToTextInfo SpellingLabelConverter(ClassicSpellingLanguage language)
+{
+    if(language != kSpellingRussian)
+        return gToRoman;
+    if(gToCyrillic == NULL)
+        CreateUnicodeToTextInfoByEncoding(kTextEncodingMacCyrillic, &gToCyrillic);
+    return gToCyrillic;
+}
+#endif
+
+static Boolean SetSuggestionLabel(Editor *editor, MenuRef menu, const SpellingSuggestion *suggestion)
+{
+#if TARGET_API_MAC_CARBON
+    (void)editor;
+    CFStringRef label = CFStringCreateWithCharacters(NULL, suggestion->text, suggestion->length);
+    if(label == NULL)
+        return false;
+    OSStatus status = SetMenuItemTextWithCFString(menu, 1, label);
+    CFRelease(label);
+    return status == noErr;
+#else
+    Str255 label;
+    ByteCount read, written;
+    ByteCount bytes = suggestion->length * sizeof(*suggestion->text);
+    UnicodeToTextInfo converter = SpellingLabelConverter(editor->spellingLanguage);
+    if(converter == NULL || ConvertFromUnicodeToText(converter, bytes, suggestion->text, 0, 0, NULL, NULL,
+                                NULL, sizeof(label) - 1, &read, &written, label + 1) != noErr ||
+       read != bytes)
+        return false;
+    label[0] = written;
+    SetMenuItemText(menu, 1, label);
+    short font = SpellingFont(editor->spellingLanguage);
+    if(font > 0)
+        SetMenuItemFontID(menu, 1, font);
+    return true;
+#endif
+}
+
+Boolean EditorContextMenu(Editor *editor, Point point, SearchField *find)
 {
     Rect text = TextBounds(editor);
     if(!PtInRect(point, &text))
@@ -1829,6 +2175,28 @@ Boolean EditorContextMenu(Editor *editor, Point point, Str255 find)
     if(!dictionary)
         DeleteMenuItem(menu, kDictionary);
 
+    unsigned mark = SpellingAtPoint(editor, point);
+    SpellingSuggestion suggestions[kSuggestionCount];
+    unsigned indexes[kSuggestionCount], count = 0, added = 0, ignoreItem = 0;
+    if(mark < editor->spellingCount) {
+        unsigned original = CountMenuItems(menu);
+        InsertMenuItem(menu, "\p(-", 0);
+        InsertMenuItem(menu, "\pIgnore in This Document", 0);
+        unsigned found = SuggestionsForMark(editor, mark, suggestions);
+        for(unsigned i = found; i > 0; --i) {
+            InsertMenuItem(menu, "\pSuggestion", 0);
+            if(SetSuggestionLabel(editor, menu, &suggestions[i - 1]))
+                indexes[count++] = i - 1;
+            else
+                DeleteMenuItem(menu, 1);
+        }
+        if(count == 0) {
+            InsertMenuItem(menu, "\pNo Spelling Suggestions", 0);
+            DisableMenuItem(menu, 1);
+        }
+        ignoreItem = count != 0 ? count + 1 : 2;
+        added = CountMenuItems(menu) - original;
+    }
     LocalToGlobal(&point);
     InsertMenu(menu, -1);
     long choice = PopUpMenuSelect(menu, point.v, point.h, 1);
@@ -1836,7 +2204,16 @@ Boolean EditorContextMenu(Editor *editor, Point point, Str255 find)
     DisposeMenu(menu);
     if((choice >> 16) != kMenu)
         return false;
-    switch(choice & 0xffff) {
+    unsigned item = choice & 0xffff;
+    if(item <= added) {
+        if(item != 0 && item <= count)
+            CorrectSpelling(editor, mark, &suggestions[indexes[count - item]]);
+        else if(item == ignoreItem)
+            IgnoreSpelling(editor, mark);
+        return false;
+    }
+    item -= added;
+    switch(item) {
         case 1: EditorCommand(editor, kCutItem); break;
         case 2: EditorCommand(editor, kCopyItem); break;
         case 3: EditorCommand(editor, kPasteItem); break;
@@ -1895,9 +2272,17 @@ static Boolean ClickMarkdown(Editor *editor, Point point, Boolean command)
     return true;
 }
 
+int EditorUnicodeEqual(const UniChar *left, const UniChar *right, size_t length)
+{
+    Boolean equal = false;
+    SInt32 order;
+    return UCCompareTextDefault(kUCCollateCaseInsensitiveMask | kUCCollatePunctuationSignificantMask,
+                                left, length, right, length, &equal, &order) == noErr && equal;
+}
+
 static DocumentQuery EditorQuery(Editor *editor, const UniChar *query, unsigned length)
 {
-    return (DocumentQuery){Source(editor), query, editor->length, length};
+    return (DocumentQuery){Source(editor), query, editor->length, length, EditorUnicodeEqual};
 }
 
 static void SelectMatch(Editor *editor, unsigned offset, unsigned length)
@@ -1906,17 +2291,382 @@ static void SelectMatch(Editor *editor, unsigned offset, unsigned length)
     Select(editor, offset + length, true, true);
 }
 
-/* The live query keeps the current match. Navigation moves one match and wraps. */
-unsigned EditorSearch(Editor *editor, ConstStr255Param input, short direction, unsigned *ordinal)
+static Boolean ScanSpelling(Editor *editor)
 {
-    UniChar query[255];
-    unsigned length = SearchText(input, query);
+    unsigned length = editor->length;
+    editor->spellingPending = false;
+    if(length == 0) {
+        ClearSpelling(editor);
+        return true;
+    }
+#if TARGET_API_MAC_CARBON
+    if(!SpellingAvailable())
+#else
+    if(!ClassicSpellingLoad(editor->spellingLanguage))
+#endif
+        return false;
+
+    const UniChar *source = Source(editor);
+    UniChar *prose = NULL;
+    if(editor->markdown) {
+        prose = malloc(length * sizeof(*prose));
+        if(prose == NULL)
+            return false;
+        if(!MarkdownSpellingText(source, length, prose)) {
+            free(prose);
+            return false;
+        }
+    }
+
+    unsigned capacity = 0, count = 0, start, offset = 0;
+    SpellingMark *marks = NULL;
+#if TARGET_API_MAC_CARBON
+    CFStringRef text = CFStringCreateWithCharacters(NULL, prose != NULL ? prose : source, length);
+    CFStringRef language = EditorSpellingLanguage(editor);
+    Boolean scanned = text != NULL;
+#else
+    char word[kSpellingWordSize];
+    Boolean scanned = true;
+#endif
+    while(scanned && offset < length) {
+#if TARGET_API_MAC_CARBON
+        CFRange match;
+        if(SpellingNext(text, offset, language, &match) != noErr) {
+            scanned = false;
+            break;
+        }
+        if(match.length == 0)
+            break;
+        start = match.location;
+        offset = start + match.length;
+#else
+        if(!ClassicSpellingWord(editor->spellingLanguage, prose != NULL ? prose : source, length, &offset, &start, word))
+            break;
+        if(ClassicSpellingAccepts(word))
+            continue;
+#endif
+        if(IsIgnoredWord(editor, source + start, offset - start))
+            continue;
+        if(count == capacity) {
+            unsigned next = capacity != 0 ? capacity * 2 : 32;
+            SpellingMark *grown = realloc(marks, next * sizeof(*marks));
+            if(grown == NULL) {
+                scanned = false;
+                break;
+            }
+            marks = grown;
+            capacity = next;
+        }
+        marks[count++] = (SpellingMark){start, offset};
+    }
+#if TARGET_API_MAC_CARBON
+    if(text != NULL)
+        CFRelease(text);
+#endif
+    free(prose);
+    if(!scanned) {
+        free(marks);
+        return false;
+    }
+    ClearSpelling(editor);
+    editor->spellingMarks = marks;
+    editor->spellingCount = count;
+    return true;
+}
+
+void EditorCheckSpelling(Editor *editor, WindowRef window)
+{
+    Boolean scanned = ScanSpelling(editor);
+    editor->spellingChecked = scanned;
+    if(!scanned || editor->spellingCount == 0) {
+        short button;
+        StandardAlert(kAlertNoteAlert,
+                      scanned ? "\pNo spelling mistakes found." : "\pCould not check spelling.",
+#if TARGET_API_MAC_CARBON
+                      scanned ? NULL : "\pThe system spelling checker may be unavailable.",
+#else
+                      scanned ? NULL : "\pLinewren needs enough free application memory to load its dictionary.",
+#endif
+                      NULL, &button);
+        SetPortWindowPort(window);
+    }
+    InvalidateWritingSurface(editor);
+}
+
+void EditorSetLiveSpelling(Editor *editor, Boolean enabled)
+{
+    editor->liveSpelling = enabled;
+    editor->spellingPending = enabled && editor->length != 0;
+    editor->spellingAt = TickCount();
+    if(!enabled) {
+        ClearSpelling(editor);
+        editor->spellingChecked = false;
+        InvalidateWritingSurface(editor);
+    }
+}
+
+enum {
+    kReviewChange = 1, kReviewDone, kReviewNext, kReviewIgnore,
+    kReviewWord, kReviewSuggestions, kReviewLanguage = 9, kSpellingDialog = 133
+};
+
+static Handle ReviewItem(DialogRef dialog, short item)
+{
+    short type;
+    Handle handle;
+    Rect bounds;
+    GetDialogItem(dialog, item, &type, &handle, &bounds);
+    return handle;
+}
+
+static pascal Boolean ReviewFilter(DialogRef dialog, EventRecord *event, DialogItemIndex *item)
+{
+    if(event->what != mouseDown || FrontWindow() != GetDialogWindow(dialog))
+        return false;
+    SetPortDialogPort(dialog);
+    Point point = event->where;
+    GlobalToLocal(&point);
+    short type;
+    Handle control;
+    Rect bounds;
+    GetDialogItem(dialog, kReviewLanguage, &type, &control, &bounds);
+    if(!PtInRect(point, &bounds))
+        return false;
+    *item = kReviewLanguage;
+    return true;
+}
+
+static void ReviewLabel(Editor *editor, Str255 label, const UniChar *text, unsigned length)
+{
+    ByteCount read, written;
+#if TARGET_API_MAC_CARBON
+    (void)editor;
+    UnicodeToTextInfo converter = gToRoman;
+#else
+    UnicodeToTextInfo converter = SpellingLabelConverter(editor->spellingLanguage);
+#endif
+    OSStatus status = converter == NULL ? paramErr : ConvertFromUnicodeToText(converter,
+        length * sizeof(*text), text, kUnicodeUseFallbacksMask, 0, NULL, NULL, NULL,
+        255, &read, &written, label + 1);
+    if(status == noErr || status == kTECUsedFallbacksStatus)
+        label[0] = written;
+    else
+        memcpy(label, "\pUnrepresentable text", sizeof("\pUnrepresentable text"));
+}
+
+static void ReviewWord(Editor *editor, ControlRef control, const UniChar *text, unsigned length)
+{
+#if TARGET_API_MAC_CARBON
+    CFStringRef word = CFStringCreateWithCharacters(NULL, text, length);
+    if(word != NULL) {
+        OSStatus status = SetControlData(control, kControlEntireControl,
+            kControlStaticTextCFStringTag, sizeof(word), &word);
+        CFRelease(word);
+        if(status == noErr) {
+            DrawOneControl(control);
+            return;
+        }
+    }
+#endif
+    Str255 label;
+    ReviewLabel(editor, label, text, length);
+    SetControlData(control, kControlEntireControl, kControlStaticTextTextTag, label[0], label + 1);
+    DrawOneControl(control);
+}
+
+static void PopulateReview(Editor *editor, DialogRef dialog, ControlRef control, ListHandle list,
+                           const SpellingSuggestion *suggestions, unsigned count,
+                           ConstStr255Param emptyMessage)
+{
+    LSetDrawingMode(false, list);
+    LDelRow(0, 0, list);
+    LAddRow(count != 0 ? count : 1, 0, list);
+    for(unsigned i = 0; i < count; ++i) {
+        Str255 label;
+        ReviewLabel(editor, label, suggestions[i].text, suggestions[i].length);
+        LSetCell(label + 1, label[0], (Cell){0, i}, list);
+    }
+    if(count != 0)
+        LSetSelect(true, (Cell){0, 0}, list);
+    else
+        LSetCell(emptyMessage + 1, emptyMessage[0], (Cell){0, 0}, list);
+    LSetDrawingMode(true, list);
+    DrawOneControl(control);
+    HiliteControl((ControlRef)ReviewItem(dialog, kReviewChange), count == 0 ? 255 : 0);
+}
+
+void EditorReviewSpelling(Editor *editor, WindowRef window,
+                          void (*languageLabel)(Editor *, Str255),
+                          Boolean (*chooseLanguage)(Editor *, WindowRef, Point))
+{
+    DialogRef dialog = GetNewDialog(kSpellingDialog, NULL, (WindowPtr)-1);
+    if(dialog == NULL)
+        return;
+    ControlRef listControl = (ControlRef)ReviewItem(dialog, kReviewSuggestions);
+    ListHandle list = NULL;
+    if(GetControlData(listControl, kControlEntireControl, kControlListBoxListHandleTag,
+                      sizeof(list), &list, NULL) != noErr || list == NULL) {
+        DisposeDialog(dialog);
+        SetPortWindowPort(window);
+        return;
+    }
+    ModalFilterUPP filter = NewModalFilterUPP(ReviewFilter);
+    if(filter == NULL) {
+        DisposeDialog(dialog);
+        SetPortWindowPort(window);
+        return;
+    }
+    SetPortDialogPort(dialog);
+    Rect bounds;
+#if TARGET_API_MAC_CARBON
+    SetListSelectionFlags(list, lOnlyOne);
+    GetListDataBounds(list, &bounds);
+#else
+    (**list).selFlags = lOnlyOne;
+    bounds = (**list).dataBounds;
+#endif
+    if(bounds.right == 0)
+        LAddColumn(1, 0, list);
+    LCellSize((Point){18, 0}, list);
+    SetDialogCancelItem(dialog, kReviewDone);
+    SetDialogDefaultItem(dialog, kReviewNext);
+    editor->spellingChecked = ScanSpelling(editor);
+    unsigned index = SpellingMarkAt(editor, editor->caret);
+    Boolean refreshLanguage = true;
+    for(;;) {
+        Boolean hasMark = editor->spellingChecked && editor->spellingCount != 0;
+        if(index >= editor->spellingCount)
+            index = 0;
+        SpellingMark mark = hasMark ? editor->spellingMarks[index] : (SpellingMark){0};
+        SpellingSuggestion suggestions[kSuggestionCount];
+        unsigned count = hasMark ? SuggestionsForMark(editor, index, suggestions) : 0;
+        SetPortWindowPort(window);
+        if(hasMark)
+            SelectMatch(editor, mark.start, mark.end - mark.start);
+        EditorDraw(editor);
+#if TARGET_API_MAC_CARBON
+        QDFlushPortBuffer(GetWindowPort(window), NULL);
+#endif
+        SetPortDialogPort(dialog);
+        if(refreshLanguage) {
+            Str255 label;
+            languageLabel(editor, label);
+            SetControlTitle((ControlRef)ReviewItem(dialog, kReviewLanguage),
+                            label[0] != 0 ? (ConstStr255Param)label : (ConstStr255Param)"\pChoose Language");
+#if !TARGET_API_MAC_CARBON
+            short font = SpellingFont(editor->spellingLanguage);
+            ControlFontStyleRec style = {.flags = kControlUseFontMask,
+                .font = font > 0 ? font : kControlFontBigSystemFont};
+            SetControlFontStyle((ControlRef)ReviewItem(dialog, kReviewWord), &style);
+            SetControlData(listControl, kControlEntireControl, kControlListBoxFontStyleTag,
+                           sizeof(style), &style);
+#endif
+            refreshLanguage = false;
+        }
+        ReviewWord(editor, (ControlRef)ReviewItem(dialog, kReviewWord),
+                   hasMark ? Source(editor) + mark.start : u"",
+                   mark.end - mark.start);
+        PopulateReview(editor, dialog, listControl, list, suggestions, count,
+                       hasMark ? "\pNo suggestions" : editor->spellingChecked
+                           ? "\pNo spelling mistakes found" : "\pCould not check spelling");
+        HiliteControl((ControlRef)ReviewItem(dialog, kReviewNext), hasMark ? 0 : 255);
+        HiliteControl((ControlRef)ReviewItem(dialog, kReviewIgnore), hasMark ? 0 : 255);
+        ShowWindow(GetDialogWindow(dialog));
+        short item;
+        Cell selected;
+        do {
+            ModalDialog(filter, &item);
+            selected = (Cell){0, 0};
+        } while(item != kReviewDone && item != kReviewLanguage &&
+                !(hasMark && (item == kReviewNext || item == kReviewIgnore ||
+                  (item == kReviewChange && count != 0 && LGetSelect(true, &selected, list) &&
+                   (unsigned)selected.v < count))));
+        if(item == kReviewDone)
+            break;
+        if(item == kReviewLanguage) {
+            Rect controlBounds;
+            short type;
+            Handle control;
+            GetDialogItem(dialog, kReviewLanguage, &type, &control, &controlBounds);
+            Point anchor = {controlBounds.top, controlBounds.left};
+            SetPortDialogPort(dialog);
+            LocalToGlobal(&anchor);
+            SetPortWindowPort(window);
+            if(chooseLanguage(editor, window, anchor)) {
+                editor->spellingChecked = ScanSpelling(editor);
+                index = SpellingMarkAt(editor, hasMark ? mark.start : editor->caret);
+                refreshLanguage = true;
+            }
+            continue;
+        }
+        SetPortWindowPort(window);
+        if(item == kReviewChange)
+            CorrectSpelling(editor, index, &suggestions[selected.v]);
+        else if(item == kReviewIgnore) {
+            IgnoreSpelling(editor, index);
+            index = SpellingMarkAt(editor, mark.end);
+        } else {
+            ++index;
+        }
+    }
+    DisposeModalFilterUPP(filter);
+    DisposeDialog(dialog);
+    SetPortWindowPort(window);
+    InvalidateWindow(window);
+}
+
+#if TARGET_API_MAC_CARBON
+CFStringRef EditorSpellingLanguage(const Editor *editor)
+{
+    return editor->spellingLanguage != NULL ? editor->spellingLanguage : SpellingDefaultLanguage();
+}
+
+CFStringRef EditorSpellingOverride(const Editor *editor)
+{
+    return editor->spellingLanguage;
+}
+
+void EditorSetSpellingLanguage(Editor *editor, CFStringRef language)
+{
+    if(language == editor->spellingLanguage ||
+       (language != NULL && editor->spellingLanguage != NULL && CFEqual(language, editor->spellingLanguage)))
+        return;
+    if(language != NULL)
+        CFRetain(language);
+    if(editor->spellingLanguage != NULL)
+        CFRelease(editor->spellingLanguage);
+    editor->spellingLanguage = language;
+#else
+ClassicSpellingLanguage EditorSpellingLanguage(const Editor *editor)
+{
+    return editor->spellingLanguage;
+}
+
+void EditorSetSpellingLanguage(Editor *editor, ClassicSpellingLanguage language)
+{
+    if(editor->spellingLanguage == language)
+        return;
+    editor->spellingLanguage = language;
+#endif
+    Boolean recheck = editor->spellingChecked || editor->liveSpelling;
+    ClearSpelling(editor);
+    ClearIgnoredWords(editor);
+    editor->spellingChecked = false;
+    editor->spellingPending = recheck && editor->length != 0;
+    editor->spellingAt = TickCount();
+    InvalidateWritingSurface(editor);
+}
+
+/* The live query keeps the current match. Navigation moves one match and wraps. */
+unsigned EditorSearch(Editor *editor, const SearchField *input, short direction, unsigned *ordinal)
+{
+    unsigned length = input->length;
     unsigned start, end;
     *ordinal = 0;
     if(length == 0)
         return 0;
     SelectionRange(editor, &start, &end);
-    DocumentMatch match = DocumentFind(EditorQuery(editor, query, length),
+    DocumentMatch match = DocumentFind(EditorQuery(editor, input->text, length),
                                        direction > 0 ? end : start, direction < 0);
     *ordinal = match.ordinal;
     if(match.count != 0)
@@ -1966,12 +2716,11 @@ static unsigned ReplaceAll(Editor *editor, DocumentQuery query,
     return applied ? matches : 0;
 }
 
-unsigned EditorReplaceText(Editor *editor, ConstStr255Param find,
-                           ConstStr255Param replacement, Boolean all)
+unsigned EditorReplaceText(Editor *editor, const SearchField *find,
+                           const SearchField *replacement, Boolean all)
 {
-    UniChar query[255], insert[255];
-    unsigned queryLength = SearchText(find, query);
-    unsigned insertLength = SearchText(replacement, insert);
+    const UniChar *query = find->text, *insert = replacement->text;
+    unsigned queryLength = find->length, insertLength = replacement->length;
     if(queryLength == 0)
         return 0;
     DocumentQuery pattern = EditorQuery(editor, query, queryLength);
@@ -1997,6 +2746,16 @@ unsigned EditorReplaceText(Editor *editor, ConstStr255Param find,
     if(next.count != 0)
         SelectMatch(editor, next.offset, queryLength);
     return 1;
+}
+
+void EditorInsertText(Editor *editor, const UniChar *text, unsigned length)
+{
+    if(length == 0)
+        return;
+    unsigned start, end;
+    SelectionRange(editor, &start, &end);
+    editor->clickCount = 0;
+    Splice(editor, start, end, text, length, start + length, true, start == end);
 }
 
 void EditorKey(Editor *editor, const EventRecord *event)
@@ -2030,8 +2789,13 @@ void EditorKey(Editor *editor, const EventRecord *event)
             Select(editor, offset, !right, extend);
             return;
         }
-        case 0x1e: MoveVertical(editor, -1, extend); return;
-        case 0x1f: MoveVertical(editor, 1, extend); return;
+        case 0x1e:
+        case 0x1f:
+            if(event->modifiers & optionKey)
+                Select(editor, ParagraphEdge(editor, editor->caret, key == 0x1f), key == 0x1f, extend);
+            else
+                MoveVertical(editor, key == 0x1f ? 1 : -1, extend);
+            return;
         case 0x0b: MoveVertical(editor, -PageSteps(editor), extend); return;
         case 0x0c: MoveVertical(editor, PageSteps(editor), extend); return;
         case 0x01: Select(editor, 0, false, extend); return;
@@ -2039,12 +2803,13 @@ void EditorKey(Editor *editor, const EventRecord *event)
         case '\b':
         case 0x7f:
             if(start == end) {
-                ATSUCursorMovementType movement = event->modifiers & optionKey
-                    ? kATSUByWord : kATSUByTypographicCluster;
-                if(key == '\b')
-                    start = CursorStepBy(editor, start, false, movement);
+                Boolean forward = key != '\b';
+                unsigned edge = event->modifiers & optionKey
+                    ? WordEdge(editor, start, forward) : CursorStep(editor, start, forward);
+                if(forward)
+                    end = edge;
                 else
-                    end = CursorStepBy(editor, end, true, movement);
+                    start = edge;
             }
             ReplaceRange(editor, start, end, NULL, 0, start, true);
             return;
@@ -2063,9 +2828,8 @@ void EditorKey(Editor *editor, const EventRecord *event)
     } else if(key < ' ') {
         return;
     }
-    UniChar ch = key;
-    ByteCount bytes;
-    if(key < 0x80 || FromRoman((const char *)&key, 1, &ch, &bytes) == noErr)
+    UniChar ch;
+    if(EditorDecodeKey(key, &ch))
         Splice(editor, start, end, &ch, 1, start + 1, true,
                start == end && key >= ' ');
 }
@@ -2090,6 +2854,63 @@ static OSStatus WriteScrap(ResType type, Size length, const void *data)
 #endif
 }
 
+#if !TARGET_API_MAC_CARBON
+static Boolean CopyClassicScriptRuns(const UniChar *text, ByteCount length, char *output)
+{
+    ScriptCode scripts[smUninterp] = {smRoman};
+    short fonts[smUninterp] = {kFontIDGeneva};
+    ItemCount scriptCount = 1;
+    for(ScriptCode script = smRoman + 1; script < smUninterp; ++script) {
+        if(GetScriptVariable(script, smScriptEnabled) <= 0)
+            continue;
+        short font = GetScriptVariable(script, smScriptAppFond);
+        if(font <= 0 || FontToScript(font) != script)
+            font = GetScriptVariable(script, smScriptSysFond);
+        if(font > 0 && FontToScript(font) == script) {
+            scripts[scriptCount++] = script;
+            fonts[script] = font;
+        }
+    }
+    UnicodeToTextRunInfo converter;
+    if(scriptCount == 1 ||
+       CreateUnicodeToTextRunInfoByScriptCode(scriptCount, scripts, &converter) != noErr)
+        return false;
+
+    enum { kMaxRuns = sizeof(ScrpSTTable) / sizeof(ScrpSTElement) };
+    ItemCount capacity = length / sizeof(*text);
+    if(capacity > kMaxRuns)
+        capacity = kMaxRuns;
+    ScriptCodeRun *runs = malloc(capacity * sizeof(*runs));
+    StScrpRec *style = malloc(offsetof(StScrpRec, scrpStyleTab) +
+                              capacity * sizeof(ScrpSTElement));
+    ByteCount read = 0, written = 0;
+    ItemCount count = 0;
+    OSStatus status = runs != NULL && style != NULL
+        ? ConvertFromUnicodeToScriptCodeRun(converter, length, text,
+            kUnicodeTextRunMask | kUnicodeUseFallbacksMask, 0, NULL, NULL, NULL,
+            length, &read, &written, output, capacity, &count, runs)
+        : memFullErr;
+    Boolean copied = (status == noErr || status == kTECUsedFallbacksStatus) &&
+                     read == length && written != 0 && count != 0;
+    if(copied) {
+        style->scrpNStyles = count;
+        for(ItemCount i = 0; i < count; ++i)
+            style->scrpStyleTab[i] = (ScrpSTElement){
+                .scrpStartChar = runs[i].offset, .scrpHeight = 14, .scrpAscent = 11,
+                .scrpFont = fonts[runs[i].script], .scrpSize = 12
+            };
+        copied = WriteScrap('TEXT', written, output) == noErr;
+        if(copied)
+            WriteScrap('styl', offsetof(StScrpRec, scrpStyleTab) +
+                               count * sizeof(ScrpSTElement), style);
+    }
+    free(style);
+    free(runs);
+    DisposeUnicodeToTextRunInfo(&converter);
+    return copied;
+}
+#endif
+
 static Boolean CopySelection(Editor *editor, unsigned start, unsigned end)
 {
     if(start == end)
@@ -2098,15 +2919,29 @@ static Boolean CopySelection(Editor *editor, unsigned start, unsigned end)
     ByteCount length = (end - start) * sizeof(*text);
     if(ClearClipboard() != noErr || WriteScrap('utxt', length, text) != noErr)
         return false;
-    Handle roman = NewHandle(length);
-    if(roman != NULL) {
-        HLock(roman);
+    Handle legacy = NewHandle(length);
+    if(legacy != NULL) {
+        HLock(legacy);
         ByteCount read, written;
-        OSStatus status = ConvertFromUnicodeToText(gToRoman, length, text, kUnicodeUseFallbacksMask,
-                                                  0, NULL, NULL, NULL, length, &read, &written, *roman);
-        if(status == noErr || status == kTECUsedFallbacksStatus)
-            WriteScrap('TEXT', written, *roman);
-        DisposeHandle(roman);
+        OptionBits flags = kUnicodeUseFallbacksMask;
+#if !TARGET_API_MAC_CARBON
+        flags = 0;
+#endif
+        OSStatus status = ConvertFromUnicodeToText(gToRoman, length, text, flags,
+                                                  0, NULL, NULL, NULL, length, &read, &written, *legacy);
+#if !TARGET_API_MAC_CARBON
+        if(status != noErr || read != length) {
+            if(CopyClassicScriptRuns(text, length, *legacy)) {
+                DisposeHandle(legacy);
+                return true;
+            }
+            status = ConvertFromUnicodeToText(gToRoman, length, text, kUnicodeUseFallbacksMask,
+                                              0, NULL, NULL, NULL, length, &read, &written, *legacy);
+        }
+#endif
+        if((status == noErr || status == kTECUsedFallbacksStatus) && read == length)
+            WriteScrap('TEXT', written, *legacy);
+        DisposeHandle(legacy);
     }
     return true;
 }
@@ -2424,6 +3259,8 @@ static void ReplayEdit(Editor *editor, EditHistory *from, EditHistory *to)
         PushHistory(to, inverse);
         editor->anchor = edit.anchor;
         Select(editor, edit.caret, edit.trailing, true);
+        if(editor->spellingChecked)
+            ScanSpelling(editor);
     } else {
         DisposeHandle(inverse.removed);
         HUnlock(edit.removed);
@@ -2518,6 +3355,7 @@ static void RefreshStyles(Editor *editor, Boolean immediate)
         editor->lastPageKnown = false;
         ScrollTo(editor, PositionAt(editor, offset));
         InvalidateWritingSurface(editor);
+        InvalidateCounter(editor);
     }
     free(styles);
 }
@@ -2525,6 +3363,11 @@ static void RefreshStyles(Editor *editor, Boolean immediate)
 void EditorIdle(Editor *editor)
 {
     RefreshStyles(editor, false);
+    if(editor->spellingPending && editor->active && TickCount() - editor->spellingAt >= 45 &&
+       ScanSpelling(editor)) {
+        editor->spellingChecked = true;
+        InvalidateWritingSurface(editor);
+    }
     unsigned long started = TickCount();
     for(unsigned span = 0; span < kIdleWrapBudget && !editor->splitsKnown; ++span) {
         if(IndexThrough(editor, editor->length, 1) != noErr || TickCount() != started)
@@ -2836,18 +3679,18 @@ static const char *CheckSearchAndPlainText(Editor *editor)
     if(EditorTakeText(editor, source) != noErr)
         return "FAIL: load the search fixture";
     unsigned ordinal;
-    if(EditorSearch(editor, "\pone", 1, &ordinal) != 2 || !EditorSelectionAt(editor, 0, 3) ||
-       EditorSearch(editor, "\pone", 1, &ordinal) != 2 || !EditorSelectionAt(editor, 8, 11))
+    if(EditorSearch(editor, &(SearchField){u"one", 3}, 1, &ordinal) != 2 || !EditorSelectionAt(editor, 0, 3) ||
+       EditorSearch(editor, &(SearchField){u"one", 3}, 1, &ordinal) != 2 || !EditorSelectionAt(editor, 8, 11))
         return "FAIL: Find did not select successive case-insensitive matches";
-    if(EditorReplaceText(editor, "\pone", "\pthree", false) != 1 ||
+    if(EditorReplaceText(editor, &(SearchField){u"one", 3}, &(SearchField){u"three", 5}, false) != 1 ||
        editor->length != 13 || memcmp(Source(editor), u"One two three", 13 * sizeof(UniChar)) != 0)
         return "FAIL: Replace did not update the selected match";
-    if(EditorReplaceText(editor, "\ptwo", "\p2", true) != 1 ||
+    if(EditorReplaceText(editor, &(SearchField){u"two", 3}, &(SearchField){u"2", 1}, true) != 1 ||
        editor->length != 11 || memcmp(Source(editor), u"One 2 three", 11 * sizeof(UniChar)) != 0)
         return "FAIL: Replace All did not update every match";
     EditorCommand(editor, kUndoItem);
     EditorCommand(editor, kUndoItem);
-    if(EditorReplaceText(editor, "\pone", "\pX", true) != 2 ||
+    if(EditorReplaceText(editor, &(SearchField){u"one", 3}, &(SearchField){u"X", 1}, true) != 2 ||
        editor->length != 7 || memcmp(Source(editor), u"X two X", 7 * sizeof(UniChar)) != 0)
         return "FAIL: Replace All did not replace both matches";
     EditorCommand(editor, kUndoItem);
@@ -3001,6 +3844,100 @@ static const char *CheckWritingSurface(Editor *editor)
     return NULL;
 }
 
+static const char *CheckSpellingWorkflow(Editor *editor)
+{
+    static const UniChar sample[] = u"**Mispelled** and recieve. `qzxqzxqzx`";
+    unsigned length = sizeof(sample) / sizeof(*sample) - 1;
+    Handle text = NewHandle(length * sizeof(*sample));
+    if(text == NULL)
+        return "FAIL: spelling fixture allocation failed";
+    memcpy(*text, sample, length * sizeof(*sample));
+    if(EditorTakeDocument(editor, text, true) != noErr) {
+        DisposeHandle(text);
+        return "FAIL: could not load the spelling fixture";
+    }
+    if(!ScanSpelling(editor) || editor->spellingCount != 2 ||
+       editor->spellingMarks[0].start != 2 || editor->spellingMarks[0].end != 11 ||
+       editor->spellingMarks[1].start != 18 || editor->spellingMarks[1].end != 25)
+        return "FAIL: spelling did not mark just the two prose typos";
+    editor->spellingChecked = true;
+    LayoutSpan *span = Layout(editor, 0);
+    if(span == NULL)
+        return "FAIL: could not lay out the spelling fixture";
+    Rect bounds = TextBounds(editor);
+    Point point = {bounds.top + 2, bounds.left + (CaretX(span, 0, 4) >> 16)};
+    if(SpellingAtPoint(editor, point) != 0)
+        return "FAIL: could not hit the first spelling mark";
+    EditorDraw(editor);
+    if(editor->layoutError != noErr)
+        return "FAIL: could not draw the spelling marks";
+    SpellingSuggestion suggestions[kSuggestionCount];
+    unsigned count = SuggestionsForMark(editor, 0, suggestions);
+    unsigned fix = 0;
+    while(fix < count && (suggestions[fix].length != 10 ||
+                         memcmp(suggestions[fix].text, u"Misspelled", 10 * sizeof(UniChar)) != 0))
+        ++fix;
+    if(fix == count || !CorrectSpelling(editor, 0, &suggestions[fix]) ||
+       editor->spellingCount != 1 || editor->spellingMarks[0].start != 19 ||
+       memcmp(Source(editor) + 2, u"Misspelled", 10 * sizeof(UniChar)) != 0)
+        return "FAIL: correction failed or shifted a later spelling mark incorrectly";
+    EditorCommand(editor, kUndoItem);
+    if(editor->spellingCount != 2 || editor->spellingMarks[0].start != 2 ||
+       editor->spellingMarks[1].start != 18 || editor->length != length ||
+       memcmp(Source(editor), sample, length * sizeof(*sample)) != 0)
+        return "FAIL: Undo did not restore the text and spelling marks";
+    EditorCommand(editor, kRedoItem);
+    if(editor->spellingCount != 1 || editor->spellingMarks[0].start != 19)
+        return "FAIL: Redo did not preserve the remaining spelling mark";
+    EditorCommand(editor, kUndoItem);
+    if(editor->spellingCount != 2)
+        return "FAIL: Undo after Redo did not restore the spelling marks";
+    IgnoreSpelling(editor, 0);
+    if(editor->spellingCount != 1 || !ScanSpelling(editor) ||
+       editor->spellingCount != 1 || editor->spellingMarks[0].start != 18)
+        return "FAIL: ignored spelling returned after rechecking";
+    EditorSetLiveSpelling(editor, true);
+    editor->spellingAt -= 45;
+    EditorIdle(editor);
+    if(editor->spellingPending || editor->spellingCount != 1 ||
+       !ReplaceRange(editor, 0, 0, u" ", 1, 1, true) ||
+       editor->spellingCount != 1 || editor->spellingMarks[0].start != 19 ||
+       !editor->spellingPending)
+        return "FAIL: live spelling did not retain and shift an unaffected mark";
+    editor->spellingAt -= 45;
+    EditorIdle(editor);
+    if(editor->spellingPending || editor->spellingCount != 1)
+        return "FAIL: live spelling did not refresh after the typing pause";
+    EditorSetLiveSpelling(editor, false);
+#if !TARGET_API_MAC_CARBON
+    static const UniChar russian[] = u"Ёлка, работал и работд.";
+    text = NewHandle(sizeof(russian) - sizeof(*russian));
+    if(text == NULL)
+        return "FAIL: Russian spelling fixture allocation failed";
+    memcpy(*text, russian, sizeof(russian) - sizeof(*russian));
+    if(EditorTakeDocument(editor, text, true) != noErr) {
+        DisposeHandle(text);
+        return "FAIL: could not load the Russian spelling fixture";
+    }
+    EditorSetSpellingLanguage(editor, kSpellingRussian);
+    if(!ScanSpelling(editor) || editor->spellingCount != 1 || editor->spellingMarks[0].start != 16)
+        return "FAIL: Russian spelling did not recognize the valid words or flag the typo";
+    count = SuggestionsForMark(editor, 0, suggestions);
+    for(fix = 0; fix < count; ++fix) {
+        if(suggestions[fix].length == 6 && memcmp(suggestions[fix].text, u"работа", 12) == 0)
+            break;
+    }
+    if(fix == count || !CorrectSpelling(editor, 0, &suggestions[fix]) ||
+       memcmp(Source(editor) + 16, u"работа", 12) != 0)
+        return "FAIL: Russian spelling did not apply a Cyrillic correction";
+    EditorSetSpellingLanguage(editor, kSpellingEnglish);
+    if(!ScanSpelling(editor) || editor->spellingCount != 0)
+        return "FAIL: switching to English did not replace the Russian checker";
+    ClassicSpellingUnload();
+#endif
+    return NULL;
+}
+
 const char *EditorSmokeTest(Editor *editor, char *timing, unsigned timingSize)
 {
     const char *input = CheckMouseAndWordSelection(editor);
@@ -3013,6 +3950,9 @@ const char *EditorSmokeTest(Editor *editor, char *timing, unsigned timingSize)
     if(input != NULL)
         return input;
     input = CheckMarkdownClicks(editor);
+    if(input != NULL)
+        return input;
+    input = CheckSpellingWorkflow(editor);
     if(input != NULL)
         return input;
     WorkspaceSmokeReset(editor->workspace);
@@ -3232,6 +4172,49 @@ const char *EditorSmokeTest(Editor *editor, char *timing, unsigned timingSize)
     EditorKey(editor, &key);
     if(!EditorIsEmpty(editor))
         goto done;
+
+#if !TARGET_API_MAC_CARBON
+    static const struct {
+        ScriptCode script;
+        const UniChar *text;
+        const char *legacy;
+    } clipboardSamples[] = {
+        {smCyrillic, u"café Привет", "caf\x8e \x8f\xf0\xe8\xe2\xe5\xf2"},
+        {smGreek, u"café Ελληνικά", "caf\x8e \xb6\xec\xec\xe8\xee\xe9\xeb\xc0"}
+    };
+    for(unsigned i = 0; i < sizeof(clipboardSamples) / sizeof(*clipboardSamples); ++i) {
+        ScriptCode script = clipboardSamples[i].script;
+        if(GetScriptVariable(script, smScriptEnabled) <= 0)
+            continue;
+        result = script == smGreek ? "FAIL: Greek TextEdit paste lost text or script font" :
+                                     "FAIL: Cyrillic TextEdit paste lost text or script font";
+        const UniChar *mixed = clipboardSamples[i].text;
+        const char *classic = clipboardSamples[i].legacy;
+        unsigned count = strlen(classic);
+        if(!ReplaceRange(editor, 0, 0, mixed, count, count, true) ||
+           !CopySelection(editor, 0, count))
+            goto done;
+        Rect bounds = {0, 0, 60, 300};
+        TEHandle destination = TEStyleNew(&bounds, &bounds);
+        if(destination == NULL)
+            goto done;
+        TEStylePaste(destination);
+        Boolean textOK = (*destination)->teLength == count &&
+                         memcmp(*TEGetText(destination), classic, count) == 0;
+        TextStyle style;
+        short height, ascent;
+        Boolean styleOK = false;
+        if(textOK) {
+            TEGetStyle(0, &style, &height, &ascent, destination);
+            styleOK = FontToScript(style.tsFont) == smRoman;
+            TEGetStyle(5, &style, &height, &ascent, destination);
+            styleOK = styleOK && FontToScript(style.tsFont) == script;
+        }
+        TEDispose(destination);
+        if(!textOK || !styleOK || !ReplaceRange(editor, 0, count, NULL, 0, 0, true))
+            goto done;
+    }
+#endif
 
     result = "FAIL: Return did not continue a list item";
     const UniChar list[] = {'-', ' ', 'a'};

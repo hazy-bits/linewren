@@ -57,6 +57,13 @@
               mkdir -p "$out/Linewren"
               cp ${powerpc}/Linewren.bin "$out/Linewren/"
               cp ${./LICENSE} "$out/Linewren/LICENSE.txt"
+              cp ${./vendor/myspell/license.readme} "$out/Linewren/MySpell License.txt"
+              cp ${./vendor/myspell/CONTRIBUTORS} "$out/Linewren/MySpell Contributors.txt"
+              cp ${./vendor/myspell/README_en_US.txt} "$out/Linewren/English Dictionary License.txt"
+              cp ${./vendor/myspell/README.linewren} "$out/Linewren/Spelling Sources.txt"
+              cp ${./vendor/dictionaries/ru_RU/LibreOffice-Russian-LICENSE.txt} "$out/Linewren/Russian Dictionary License.txt"
+              cp ${./vendor/dictionaries/ru_RU/README.txt} "$out/Linewren/Russian Dictionary Sources.txt"
+              cp ${./vendor/dictionaries/ru_RU/wordfreq-NOTICE.md} "$out/Linewren/wordfreq Notices.txt"
               cd "$out"
               zip -qr ${pkgs.lib.escapeShellArg classicArchive} Linewren
             '';

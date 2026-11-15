@@ -2,8 +2,14 @@
 #include "workspace.h"
 #include "document.h"
 #include "text-files.h"
+#if TARGET_API_MAC_CARBON
+#include "spelling.h"
+#endif
 
 #include <Dialogs.h>
+#include <ControlDefinitions.h>
+#include <Script.h>
+#include <UnicodeConverter.h>
 #include <AERegistry.h>
 #include <Aliases.h>
 #include <AppleEvents.h>
@@ -43,6 +49,9 @@ typedef struct {
     short depth;
     SidebarRowKind kind;
     Boolean expanded;
+#if !TARGET_API_MAC_CARBON
+    short filenameFont;
+#endif
 } SidebarEntry;
 
 typedef struct {
@@ -52,7 +61,12 @@ typedef struct {
 
 struct Workspace {
     FSSpec file;
+#if !TARGET_API_MAC_CARBON
+    short titleFont;
+#endif
     Handle diskBytes;
+    TextFileFormat format;
+    Boolean readOnly;
     DiskStamp diskStamp;
     Boolean diskStampKnown, diskChanged;
     unsigned long checkedAt;
@@ -72,7 +86,7 @@ struct Workspace {
 };
 
 static void NewFileInFolder(Editor *editor, WindowRef window, const SidebarEntry *folder);
-static OSErr AskName(WindowRef window, ConstStr255Param initial, Boolean rename, Str255 name);
+static OSErr AskName(WindowRef window, const FSSpec *file, Str255 name, ScriptCode *script);
 
 static void Status(Workspace *workspace, WindowRef window, ConstStr255Param message)
 {
@@ -87,11 +101,22 @@ static void FileError(Workspace *workspace, WindowRef window, OSErr error, Boole
 {
     Str255 message;
     if(error == fBsyErr && saving) {
-        Status(workspace, window, "\pFile changed on disk. Use Save As to keep your edits.");
+        Status(workspace, window, "\pFile changed on disk. Use Reload from Disk or Save As.");
     } else if(error == kTextMalformedInputErr) {
-        Status(workspace, window, "\pThis document must contain valid UTF-8 text.");
+        Status(workspace, window, "\pInvalid UTF-8. For legacy text, use File > Open as MacRoman.");
+    } else if(error == kTextUnsupportedEncodingErr && saving) {
+        Status(workspace, window, "\pSome characters cannot be saved as MacRoman. Use Save As for UTF-8.");
+    } else if(error == kTextMixedEndingsErr && saving) {
+        Status(workspace, window, "\pMixed line endings. Use Save As to make an LF copy.");
+    } else if(error == kTextTooLargeErr) {
+        Status(workspace, window, "\pThis file exceeds Linewren's 192 KiB limit.");
+    } else if(saving && (error == wPrErr || error == vLckdErr || error == fLckdErr ||
+                         error == permErr || error == afpAccessDenied)) {
+        Status(workspace, window, workspace->readOnly
+            ? "\pRead-only original. Use Save As to keep edits."
+            : "\pCannot write here. Use Save As to choose a writable location.");
     } else if(error == memFullErr) {
-        Status(workspace, window, "\pDocument too large or insufficient memory.");
+        Status(workspace, window, "\pInsufficient memory.");
     } else {
         int length = snprintf((char *)message + 1, sizeof(message) - 1,
                               "%s failed (error %d)", saving ? "Save" : "Open", error);
@@ -137,6 +162,55 @@ static OSErr ReadFileCatalog(const FSSpec *file, CInfoPBRec *info)
     info->hFileInfo.ioVRefNum = file->vRefNum;
     info->hFileInfo.ioDirID = file->parID;
     return PBGetCatInfoSync(info);
+}
+
+#if !TARGET_API_MAC_CARBON
+static ScriptCode FilenameScript(const FSSpec *file)
+{
+    FSRef ref;
+    FSCatalogInfo info;
+    if(FSpMakeFSRef(file, &ref) == noErr &&
+       FSGetCatalogInfo(&ref, kFSCatInfoTextEncoding, &info, NULL, NULL, NULL) == noErr &&
+       GetTextEncodingBase(info.textEncodingHint) == kTextEncodingMacCyrillic)
+        return smCyrillic;
+    return smRoman;
+}
+
+short WorkspaceCyrillicFont(void)
+{
+    short font = 0;
+    GetFNum("\pCharcoal CY", &font);
+    return font > 0 ? font : GetScriptVariable(smCyrillic, smScriptSysFond);
+}
+
+short WorkspaceFilenameFont(const FSSpec *file)
+{
+    return file != NULL && FilenameScript(file) == smCyrillic ? WorkspaceCyrillicFont() : 0;
+}
+
+short WorkspaceTitleFont(const Workspace *workspace) { return workspace->titleFont; }
+#endif
+
+static void SetFileTitle(Workspace *workspace, WindowRef window, const FSSpec *file)
+{
+#if TARGET_API_MAC_CARBON
+    (void)workspace;
+    FSRef ref;
+    HFSUniStr255 name;
+    if(FSpMakeFSRef(file, &ref) == noErr &&
+       FSGetCatalogInfo(&ref, kFSCatInfoNone, NULL, &name, NULL, NULL) == noErr) {
+        CFStringRef title = CFStringCreateWithCharacters(NULL, name.unicode, name.length);
+        if(title != NULL) {
+            OSStatus status = SetWindowTitleWithCFString(window, title);
+            CFRelease(title);
+            if(status == noErr)
+                return;
+        }
+    }
+#else
+    workspace->titleFont = WorkspaceFilenameFont(file);
+#endif
+    SetWTitle(window, file->name);
 }
 
 static DocumentKind FileKind(const FSSpec *file)
@@ -244,8 +318,14 @@ static void AddRow(Workspace *workspace, const SidebarEntry *entry, long *skip, 
         --*skip;
     else if(workspace->rowCount == capacity)
         workspace->more = true;
-    else
-        workspace->rows[workspace->rowCount++] = *entry;
+    else {
+        SidebarEntry *row = &workspace->rows[workspace->rowCount++];
+        *row = *entry;
+#if !TARGET_API_MAC_CARBON
+        if(row->kind != kSeparator)
+            row->filenameFont = WorkspaceFilenameFont(&row->file);
+#endif
+    }
 }
 
 /* Both the sidebar and Quick Open expose the same catalog entries. */
@@ -441,7 +521,18 @@ unsigned WorkspaceCopyFolders(Workspace *workspace, FSSpec *folders, unsigned ca
     return count;
 }
 
-static void SearchFolder(short volume, long directory, short depth, ConstStr255Param query,
+static Boolean NameMatches(const FSSpec *file, const SearchField *query)
+{
+    HFSUniStr255 name;
+    FSRef ref;
+    if(FSpMakeFSRef(file, &ref) != noErr ||
+       FSGetCatalogInfo(&ref, kFSCatInfoNone, NULL, &name, NULL, NULL) != noErr)
+        name.length = EditorDecodeRoman((const char *)file->name + 1, file->name[0], name.unicode);
+    DocumentQuery pattern = {name.unicode, query->text, name.length, query->length, EditorUnicodeEqual};
+    return DocumentNextMatch(pattern, 0) < name.length;
+}
+
+static void SearchFolder(short volume, long directory, short depth, const SearchField *query,
                          FSSpec *files, unsigned capacity, unsigned *count)
 {
     if(depth > kMaxDepth || *count == capacity)
@@ -453,8 +544,7 @@ static void SearchFolder(short volume, long directory, short depth, ConstStr255P
         const FSSpec *file = &entry.file;
         if(entry.kind == kFolderRow) {
             SearchFolder(volume, entry.directory, depth + 1, query, files, capacity, count);
-        } else if(entry.kind == kFileRow &&
-                  DocumentNameMatches(file->name + 1, file->name[0], query + 1, query[0])) {
+        } else if(entry.kind == kFileRow && NameMatches(file, query)) {
             Boolean duplicate = false;
             for(unsigned i = 0; i < *count; ++i)
                 duplicate |= files[i].vRefNum == file->vRefNum &&
@@ -467,7 +557,7 @@ static void SearchFolder(short volume, long directory, short depth, ConstStr255P
     }
 }
 
-unsigned WorkspaceSearch(Workspace *workspace, ConstStr255Param query,
+unsigned WorkspaceSearch(Workspace *workspace, const SearchField *query,
                          FSSpec *files, unsigned capacity)
 {
     unsigned count = 0;
@@ -504,8 +594,36 @@ short WorkspaceLabelFont(void)
     return font;
 }
 
+Rect WorkspaceLanguageBounds(Rect canvas, ConstStr255Param counter, ConstStr255Param language)
+{
+    if(language[0] == 0)
+        return (Rect){0};
+    GrafPtr port;
+    GetPort(&port);
+#if TARGET_API_MAC_CARBON
+    short font = GetPortTextFont((CGrafPtr)port);
+    short size = GetPortTextSize((CGrafPtr)port);
+    Style face = GetPortTextFace((CGrafPtr)port);
+#else
+    short font = port->txFont, size = port->txSize;
+    Style face = port->txFace;
+#endif
+    TextFont(WorkspaceLabelFont());
+    TextSize(10);
+    TextFace(normal);
+    short right = canvas.right - 19 - (counter[0] != 0 ? StringWidth(counter) + 16 : 0);
+    short width = StringWidth(language) + 20;
+    TextFont(font);
+    TextSize(size);
+    TextFace(face);
+    if(width > 154)
+        width = 154;
+    return (Rect){canvas.bottom - 22, right - width, canvas.bottom, right};
+}
+
 void WorkspaceDraw(Workspace *workspace, WindowRef window, const EditorTheme *theme,
-                   ConstStr255Param counter, Boolean sidebarVisible, Boolean footerVisible)
+                   ConstStr255Param counter, ConstStr255Param language,
+                   Boolean sidebarVisible, Boolean footerVisible)
 {
     short width = WindowCanvas(window).right;
     short bottom = WindowCanvas(window).bottom;
@@ -516,7 +634,8 @@ void WorkspaceDraw(Workspace *workspace, WindowRef window, const EditorTheme *th
         EraseRect(&sidebar);
     if(footerVisible)
         EraseRect(&footer);
-    TextFont(WorkspaceLabelFont());
+    short labelFont = WorkspaceLabelFont();
+    TextFont(labelFont);
     TextSize(10);
     TextFace(normal);
     RGBForeColor(&theme->divider);
@@ -530,9 +649,19 @@ void WorkspaceDraw(Workspace *workspace, WindowRef window, const EditorTheme *th
         RGBForeColor(&theme->text);
         short counterWidth = StringWidth(counter);
         short counterLeft = width - 23 - counterWidth;
-        DrawLabel(10, bottom - 8, counterLeft - 20, workspace->status);
+        Rect picker = WorkspaceLanguageBounds(WindowCanvas(window), counter, language);
+        short statusRight = EmptyRect(&picker) ? counterLeft : picker.left;
+        if(statusRight > 20)
+            DrawLabel(10, bottom - 8, statusRight - 20, workspace->status);
         if(counter[0] != 0)
             DrawLabel(counterLeft, bottom - 8, counterWidth, counter);
+        if(!EmptyRect(&picker)) {
+            RGBForeColor(&theme->secondary);
+            DrawLabel(picker.left + 4, bottom - 8, picker.right - picker.left - 20, language);
+            MoveTo(picker.right - 12, bottom - 13);
+            Line(3, 3);
+            Line(3, -3);
+        }
     }
 
     if(!sidebarVisible)
@@ -561,7 +690,11 @@ void WorkspaceDraw(Workspace *workspace, WindowRef window, const EditorTheme *th
         }
 
         short indent = 12 + 11 * (entry->depth > 8 ? 8 : entry->depth);
-        Boolean active = entry->kind == kFileRow && WorkspaceHasFile(workspace, &entry->file);
+        /* Sidebar entries and the current file already use volume references. */
+        Boolean active = entry->kind == kFileRow && workspace->diskBytes != NULL &&
+                         workspace->file.vRefNum == entry->file.vRefNum &&
+                         workspace->file.parID == entry->file.parID &&
+                         EqualString(workspace->file.name, entry->file.name, false, true);
         if(active) {
             Rect highlight = {top + 1, 6, top + kRowHeight - 1, kSidebarWidth - 6};
             RGBForeColor(&theme->divider);
@@ -583,7 +716,15 @@ void WorkspaceDraw(Workspace *workspace, WindowRef window, const EditorTheme *th
             if(entry->depth == 0)
                 TextFace(bold);
         }
+#if !TARGET_API_MAC_CARBON
+        if(entry->filenameFont > 0)
+            TextFont(entry->filenameFont);
+#endif
         DrawLabel(indent + 12, top + 13, kSidebarWidth - indent - 22, entry->file.name);
+#if !TARGET_API_MAC_CARBON
+        if(entry->filenameFont > 0)
+            TextFont(labelFont);
+#endif
         TextFace(normal);
         RGBBackColor(&theme->panel);
     }
@@ -656,14 +797,20 @@ static void RefreshSidebars(void)
     SetPort(port);
 }
 
-static OSErr RenameEntry(const SidebarEntry *entry, const FSSpec *file, ConstStr255Param name)
+static OSErr RenameEntry(const SidebarEntry *entry, const FSSpec *file, ConstStr255Param name,
+                         ScriptCode script)
 {
+    FSSpec renamed = *file;
+#if TARGET_API_MAC_CARBON
+    (void)script;
     OSErr error = FSpRename(file, name);
+    memcpy(renamed.name, name, name[0] + 1);
+#else
+    OSErr error = RenameClassicFile(&renamed, name, script);
+#endif
     if(error != noErr)
         return error;
-    FSSpec renamed = *file;
-    renamed.vRefNum = VolumeReference(file->vRefNum);
-    memcpy(renamed.name, name, name[0] + 1);
+    renamed.vRefNum = VolumeReference(renamed.vRefNum);
     GrafPtr port;
     GetPort(&port);
     for(WindowRef window = FrontWindow(); window != NULL; window = GetNextWindow(window)) {
@@ -678,7 +825,7 @@ static OSErr RenameEntry(const SidebarEntry *entry, const FSSpec *file, ConstStr
         } else if(WorkspaceHasFile(workspace, file)) {
             workspace->file = renamed;
             SetPortWindowPort(window);
-            SetWTitle(window, name);
+            SetFileTitle(workspace, window, &workspace->file);
             EditorSetMarkdown(editor, FileKind(&renamed) == kDocumentMarkdown);
         }
     }
@@ -715,6 +862,64 @@ static OSErr EntryID(const FSSpec *file, Boolean folder, long *id)
     return noErr;
 }
 
+#if !TARGET_API_MAC_CARBON
+/* Keep the choice in Preferences. The catalog identity survives renames and autosaves. */
+static OSErr SpellingPreference(const FSSpec *file, FSSpec *preference)
+{
+    CInfoPBRec info;
+    OSErr error = ReadFileCatalog(file, &info);
+    if(error != noErr)
+        return error;
+    HParamBlockRec source = {0};
+    source.volumeParam.ioVRefNum = VolumeReference(file->vRefNum);
+    error = PBHGetVInfoSync(&source);
+    if(error != noErr)
+        return error;
+    short volume;
+    long directory;
+    error = FindFolder(kOnSystemDisk, kPreferencesFolderType, kCreateFolder, &volume, &directory);
+    if(error != noErr)
+        return error;
+#ifdef LINEWREN_SMOKE_TEST
+    ConstStr255Param folderName = "\pLinewren Spelling Test";
+#else
+    ConstStr255Param folderName = "\pLinewren Spelling";
+#endif
+    FSSpec folder;
+    error = FSMakeFSSpec(volume, directory, folderName, &folder);
+    if(error == fnfErr)
+        error = FSpDirCreate(&folder, smSystemScript, &directory);
+    else if(error == noErr)
+        error = EntryID(&folder, true, &directory);
+    if(error != noErr)
+        return error;
+    Str31 key;
+    key[0] = snprintf((char *)key + 1, sizeof(key) - 1, "%08lx-%08lx-%08lx",
+                      source.volumeParam.ioVCrDate, (unsigned long)info.hFileInfo.ioDirID,
+                      info.hFileInfo.ioFlCrDat);
+    return FSMakeFSSpec(volume, directory, key, preference);
+}
+
+Boolean WorkspaceRememberSpelling(Editor *editor)
+{
+    const FSSpec *file = WorkspaceCurrentFile(EditorWorkspace(editor));
+    if(file == NULL)
+        return true;
+    FSSpec preference = {0};
+    OSErr error = SpellingPreference(file, &preference);
+    if(EditorSpellingLanguage(editor) == kSpellingRussian) {
+        if(error == fnfErr && preference.name[0] != 0)
+            error = FSpCreate(&preference, 'Lnwr', 'pref', smSystemScript);
+    } else {
+        if(error == noErr)
+            error = FSpDelete(&preference);
+        if(error == fnfErr)
+            return true;
+    }
+    return error == noErr && FlushVol(NULL, preference.vRefNum) == noErr;
+}
+#endif
+
 static OSErr VerifyEntry(const FSSpec *file, Boolean folder, long expected)
 {
     long id;
@@ -748,8 +953,16 @@ static OSErr TrashEntry(Editor *editor, WindowRef window, const SidebarEntry *en
         DisposeHandle(workspace->diskBytes);
         workspace->diskBytes = NULL;
         workspace->file = (FSSpec){0};
+#if TARGET_API_MAC_CARBON
+        EditorSetSpellingLanguage(editor, NULL);
+#else
+        EditorSetSpellingLanguage(editor, kSpellingEnglish);
+#endif
         workspace->dirty = workspace->pending = false;
         workspace->diskChanged = workspace->diskStampKnown = false;
+#if !TARGET_API_MAC_CARBON
+        workspace->titleFont = 0;
+#endif
         SetWTitle(window, "\pUntitled");
         Status(workspace, window, "\pMoved to Trash");
     }
@@ -867,11 +1080,12 @@ static void ShowSidebarMenu(Editor *editor, WindowRef window, Point point, Sideb
         case kRename: {
             action = "Rename";
             Str255 name;
-            error = AskName(window, file.name, true, name);
+            ScriptCode script;
+            error = AskName(window, &file, name, &script);
             if(error == noErr && !EqualString(file.name, name, true, true)) {
                 error = VerifyEntry(&file, folder, identity);
                 if(error == noErr)
-                    error = RenameEntry(&entry, &file, name);
+                    error = RenameEntry(&entry, &file, name, script);
             }
             break;
         }
@@ -1106,7 +1320,7 @@ static OSErr Checkpoint(Editor *editor)
 }
 
 static OSErr LoadDocument(Editor *editor, WindowRef window, const FSSpec *file,
-                          Handle bytes, Handle text)
+                          Handle bytes, Handle text, Boolean reloading)
 {
     Workspace *workspace = EditorWorkspace(editor);
     SetPortWindowPort(window);
@@ -1118,11 +1332,28 @@ static OSErr LoadDocument(Editor *editor, WindowRef window, const FSSpec *file,
         DisposeHandle(workspace->diskBytes);
     workspace->diskBytes = bytes;
     workspace->file = *file;
+#if TARGET_API_MAC_CARBON
+    if(!reloading) {
+        CFStringRef language = SpellingCopyFileLanguage(file);
+        EditorSetSpellingLanguage(editor,
+            language != NULL && SpellingLanguageSupported(language) ? language : NULL);
+        if(language != NULL)
+            CFRelease(language);
+    }
+#else
+    if(!reloading) {
+        FSSpec preference;
+        EditorSetSpellingLanguage(editor, SpellingPreference(file, &preference) == noErr
+            ? kSpellingRussian : kSpellingEnglish);
+    }
+#endif
+    workspace->format = (TextFileFormat){0};
+    workspace->readOnly = false;
     workspace->file.vRefNum = VolumeReference(file->vRefNum);
     ResetDiskCheck(workspace);
     workspace->dirty = false;
     workspace->pending = false;
-    SetWTitle(window, file->name);
+    SetFileTitle(workspace, window, &workspace->file);
     if(workspace->roots == NULL)
         WorkspaceAttachFolder(workspace, window, file->vRefNum, file->parID);
     else
@@ -1131,16 +1362,46 @@ static OSErr LoadDocument(Editor *editor, WindowRef window, const FSSpec *file,
     return noErr;
 }
 
-OSErr WorkspaceOpen(Editor *editor, WindowRef window, const FSSpec *file)
+static Boolean IsReadOnly(const FSSpec *file)
+{
+    CInfoPBRec info;
+    if(ReadFileCatalog(file, &info) == noErr && (info.hFileInfo.ioFlAttrib & kioFlAttribLockedMask))
+        return true;
+    FSSpec parent;
+    if(FSMakeFSSpec(file->vRefNum, file->parID, "\p", &parent) == noErr &&
+       ReadFileCatalog(&parent, &info) == noErr &&
+       (info.dirInfo.ioACUser & kioACUserNoMakeChangesMask))
+        return true;
+    HParamBlockRec volume = {0};
+    volume.volumeParam.ioVRefNum = VolumeReference(file->vRefNum);
+    return PBHGetVInfoSync(&volume) == noErr &&
+           (volume.volumeParam.ioVAtrb & (kioVAtrbHardwareLockedMask | kioVAtrbSoftwareLockedMask));
+}
+
+static void SetFileFormat(Workspace *workspace, WindowRef window, TextFileFormat format)
+{
+    workspace->format = format;
+    workspace->readOnly = IsReadOnly(&workspace->file);
+    if(workspace->readOnly)
+        Status(workspace, window, "\pRead-only original. Use Save As to keep edits.");
+    else if(format.endings == kTextMixed)
+        Status(workspace, window, "\pMixed line endings. Use Save As to make an LF copy.");
+}
+
+static OSErr OpenFile(Editor *editor, WindowRef window, const FSSpec *file,
+                      Boolean macRoman, Boolean reloading)
 {
     Handle bytes, text = NULL;
+    TextFileFormat format = {.macRoman = macRoman};
     OSErr error = ReadTextFile(file, &bytes);
     if(error == noErr)
-        error = DecodeTextFile(bytes, &text);
-    if(error == noErr && !WorkspaceCanClose(editor, window))
+        error = DecodeTextWithFormat(bytes, &text, &format);
+    if(error == noErr && !reloading && !WorkspaceCanClose(editor, window))
         error = userCanceledErr;
     if(error == noErr)
-        error = LoadDocument(editor, window, file, bytes, text);
+        error = LoadDocument(editor, window, file, bytes, text, reloading);
+    if(error == noErr)
+        SetFileFormat(EditorWorkspace(editor), window, format);
     if(error != noErr) {
         if(bytes != NULL)
             DisposeHandle(bytes);
@@ -1148,6 +1409,36 @@ OSErr WorkspaceOpen(Editor *editor, WindowRef window, const FSSpec *file)
             DisposeHandle(text);
     }
     return error;
+}
+
+OSErr WorkspaceOpen(Editor *editor, WindowRef window, const FSSpec *file)
+{
+    return OpenFile(editor, window, file, false, false);
+}
+
+OSErr WorkspaceOpenMacRoman(Editor *editor, WindowRef window, const FSSpec *file)
+{
+    return OpenFile(editor, window, file, true, false);
+}
+
+void WorkspaceReload(Editor *editor, WindowRef window)
+{
+    Workspace *workspace = EditorWorkspace(editor);
+    if(workspace->diskBytes == NULL)
+        return;
+    if(workspace->dirty || workspace->pending) {
+        switch(CautionAlert(132, NULL)) {
+            case 1:
+                WorkspaceSave(editor, window, true);
+                return;
+            case 3: break;
+            default: return;
+        }
+    }
+    FSSpec file = workspace->file;
+    OSErr error = OpenFile(editor, window, &file, workspace->format.macRoman, true);
+    if(error != noErr)
+        FileError(workspace, window, error, false);
 }
 
 void WorkspaceOpenError(Workspace *workspace, WindowRef window, OSErr error)
@@ -1170,15 +1461,27 @@ static void CommitPending(Workspace *workspace)
     workspace->pending = false;
 }
 
-static OSErr SaveTo(Editor *editor, WindowRef window, const FSSpec *file, Boolean newFile)
+static OSErr SaveTo(Editor *editor, WindowRef window, const FSSpec *file, Boolean newFile, ScriptCode script)
 {
     Workspace *workspace = EditorWorkspace(editor);
     Handle bytes;
-    OSErr error = EditorEncodeText(editor, &bytes);
+    TextFileFormat format = newFile ? (TextFileFormat){0} : workspace->format;
+    OSErr error = EditorEncodeFile(editor, format, &bytes);
     if(error != noErr)
         return error;
-    error = WriteTextFile(file, bytes, newFile ? NULL : workspace->diskBytes);
+    FSSpec saved = *file;
+#if !TARGET_API_MAC_CARBON
+    if(newFile && script == smCyrillic)
+        error = CreateClassicTextFile(&saved, bytes, script);
+    else
+#else
+    (void)script;
+#endif
+        error = WriteTextFile(file, bytes, newFile ? NULL : workspace->diskBytes);
     if(error != noErr) {
+        if(!newFile && (error == wPrErr || error == vLckdErr || error == fLckdErr ||
+                        error == permErr || error == afpAccessDenied))
+            workspace->readOnly = true;
         DisposeHandle(bytes);
         return error;
     }
@@ -1186,12 +1489,13 @@ static OSErr SaveTo(Editor *editor, WindowRef window, const FSSpec *file, Boolea
     if(workspace->diskBytes != NULL)
         DisposeHandle(workspace->diskBytes);
     workspace->diskBytes = bytes;
-    workspace->file = *file;
+    workspace->file = saved;
     workspace->file.vRefNum = VolumeReference(file->vRefNum);
     ResetDiskCheck(workspace);
-    EditorSetMarkdown(editor, FileKind(file) == kDocumentMarkdown);
+    EditorSetMarkdown(editor, FileKind(&workspace->file) == kDocumentMarkdown);
     workspace->dirty = false;
-    SetWTitle(window, file->name);
+    if(newFile)
+        SetFileTitle(workspace, window, &workspace->file);
     if(newFile) {
         if(workspace->roots == NULL)
             WorkspaceAttachFolder(workspace, window, file->vRefNum, file->parID);
@@ -1199,6 +1503,15 @@ static OSErr SaveTo(Editor *editor, WindowRef window, const FSSpec *file, Boolea
             WorkspaceRefreshSidebar(workspace, window);
     }
     Status(workspace, window, "\pSaved");
+    SetFileFormat(workspace, window, format);
+#if TARGET_API_MAC_CARBON
+    if(newFile && EditorSpellingOverride(editor) != NULL &&
+       !SpellingSaveFileLanguage(&workspace->file, EditorSpellingOverride(editor)))
+        Status(workspace, window, "\pSaved. Spelling language could not be remembered.");
+#else
+    if(newFile && EditorSpellingLanguage(editor) == kSpellingRussian && !WorkspaceRememberSpelling(editor))
+        Status(workspace, window, "\pSaved. Spelling language could not be remembered.");
+#endif
     return noErr;
 }
 
@@ -1210,8 +1523,9 @@ void WorkspaceIdle(Editor *editor, WindowRef window)
     if(workspace->pending && now - workspace->editedAt >= kAutosaveDelay) {
         SetPortWindowPort(window);
         CommitPending(workspace);
-        if(workspace->dirty && workspace->diskBytes != NULL)
-            saveError = SaveTo(editor, window, &workspace->file, false);
+        if(workspace->dirty && workspace->diskBytes != NULL && !workspace->readOnly &&
+           workspace->format.endings != kTextMixed)
+            saveError = SaveTo(editor, window, &workspace->file, false, smRoman);
         if(saveError != noErr)
             FileError(workspace, window, saveError, true);
     }
@@ -1260,13 +1574,18 @@ void WorkspaceCheckExternal(Workspace *workspace, WindowRef window, Boolean forc
     }
     if(changed != workspace->diskChanged) {
         workspace->diskChanged = changed;
-        Status(workspace, window, changed ? "\pFile changed on disk. Close and reopen to reload."
-                                          : "\pSaved");
+        if(changed)
+            Status(workspace, window, "\pFile changed on disk. Use File > Reload from Disk.");
+        else {
+            Status(workspace, window, "\pSaved");
+            SetFileFormat(workspace, window, workspace->format);
+        }
     }
 }
 
-static OSErr ChooseSaveFile(ConstStr255Param suggested, FSSpec *file)
+static OSErr ChooseSaveFile(ConstStr255Param suggested, FSSpec *file, ScriptCode *script)
 {
+    *script = smRoman;
 #if TARGET_API_MAC_CARBON
     NavDialogCreationOptions options;
     OSErr error = NavGetDefaultDialogCreationOptions(&options);
@@ -1327,6 +1646,7 @@ static OSErr ChooseSaveFile(ConstStr255Param suggested, FSSpec *file)
     if(!reply.sfGood)
         return userCanceledErr;
     *file = reply.sfFile;
+    *script = reply.sfScript;
     return reply.sfReplacing ? dupFNErr : noErr;
 #endif
 }
@@ -1346,19 +1666,22 @@ Boolean WorkspaceSave(Editor *editor, WindowRef window, Boolean saveAs)
             ConstStr255Param name = EditorIsMarkdown(editor) ? "\pUntitled.md" : "\pUntitled.txt";
             memcpy(suggested, name, name[0] + 1);
         }
-        error = ChooseSaveFile(suggested, &file);
+        ScriptCode script;
+        error = ChooseSaveFile(suggested, &file, &script);
         SetPortWindowPort(window);
         if(error == userCanceledErr)
             return false;
         if(error == noErr)
-            error = SaveTo(editor, window, &file, true);
+            error = SaveTo(editor, window, &file, true, script);
         if(error == dupFNErr) {
             Status(workspace, window, "\pChoose a new filename.");
             SysBeep(1);
             return false;
         }
     } else if(workspace->dirty) {
-        error = SaveTo(editor, window, &workspace->file, false);
+        if(workspace->readOnly && IsReadOnly(&workspace->file))
+            return WorkspaceSave(editor, window, true);
+        error = SaveTo(editor, window, &workspace->file, false, smRoman);
     }
     if(error != noErr)
         FileError(workspace, window, error, true);
@@ -1372,7 +1695,7 @@ Boolean WorkspaceCanClose(Editor *editor, WindowRef window)
     CommitPending(workspace);
     if(!workspace->dirty)
         return true;
-    if(workspace->diskBytes != NULL && WorkspaceSave(editor, window, false))
+    if(workspace->diskBytes != NULL && !workspace->readOnly && WorkspaceSave(editor, window, false))
         return true;
     switch(CautionAlert(129, NULL)) {
         case 1: return WorkspaceSave(editor, window, workspace->diskBytes != NULL);
@@ -1382,21 +1705,25 @@ Boolean WorkspaceCanClose(Editor *editor, WindowRef window)
 }
 
 static OSErr CreateDocument(Editor *editor, WindowRef window, const SidebarEntry *folder,
-                            ConstStr255Param name)
+                            ConstStr255Param name, ScriptCode script)
 {
-    FSSpec file;
-    OSErr error = FSMakeFSSpec(folder->file.vRefNum, folder->directory, name, &file);
-    if(error != fnfErr)
-        return error == noErr ? dupFNErr : error;
+    FSSpec file = {.vRefNum = folder->file.vRefNum, .parID = folder->directory};
+    memcpy(file.name, name, name[0] + 1);
+    OSErr error;
     Handle bytes = NewHandle(0), text = NewHandle(0);
     if(bytes == NULL || text == NULL) {
         error = memFullErr;
     } else if(!WorkspaceCanClose(editor, window)) {
         error = userCanceledErr;
     } else {
+#if !TARGET_API_MAC_CARBON
+        error = CreateClassicTextFile(&file, bytes, script);
+#else
+        (void)script;
         error = WriteTextFile(&file, bytes, NULL);
+#endif
         if(error == noErr) {
-            error = LoadDocument(editor, window, &file, bytes, text);
+            error = LoadDocument(editor, window, &file, bytes, text, false);
             if(error == noErr) {
                 Workspace *workspace = EditorWorkspace(editor);
                 if(folder->depth < kMaxDepth &&
@@ -1448,8 +1775,34 @@ static Boolean MarkdownName(Str255 name)
     return name[0] <= 31;
 }
 
-static OSErr AskName(WindowRef window, ConstStr255Param initial, Boolean rename, Str255 name)
+#if !TARGET_API_MAC_CARBON
+static void NameFieldFont(DialogRef dialog, ScriptCode script)
 {
+    short type;
+    Handle field;
+    Rect bounds;
+    GetDialogItem(dialog, 4, &type, &field, &bounds);
+    SetWRefCon(GetDialogWindow(dialog), script);
+    short font = script == smCyrillic ? WorkspaceCyrillicFont() : 0;
+    ControlFontStyleRec style = {.flags = kControlUseFontMask, .font = font > 0 ? font : 0};
+    SetControlFontStyle((ControlRef)field, &style);
+}
+
+static pascal Boolean NameFilter(DialogRef dialog, EventRecord *event, DialogItemIndex *item)
+{
+    (void)item;
+    if((event->what == keyDown || event->what == autoKey) &&
+       (event->message & charCodeMask) >= 0x80)
+        NameFieldFont(dialog, GetScriptManagerVariable(smKeyScript));
+    return false;
+}
+#endif
+
+static OSErr AskName(WindowRef window, const FSSpec *file, Str255 name, ScriptCode *script)
+{
+    Boolean rename = file != NULL;
+    ConstStr255Param initial = rename ? file->name : (ConstStr255Param)"\pUntitled.md";
+    *script = smRoman;
     DialogRef dialog = GetNewDialog(130, NULL, (WindowPtr)-1);
     if(dialog == NULL)
         return memFullErr;
@@ -1458,7 +1811,19 @@ static OSErr AskName(WindowRef window, ConstStr255Param initial, Boolean rename,
     Handle field;
     Rect bounds;
     GetDialogItem(dialog, 4, &type, &field, &bounds);
+#if TARGET_API_MAC_CARBON
     SetDialogItemText(field, initial);
+#else
+    ControlRef edit = (ControlRef)field;
+    SetControlData(edit, kControlEntireControl, kControlEditTextTextTag, initial[0], initial + 1);
+#endif
+    ModalFilterUPP filter = NULL;
+#if !TARGET_API_MAC_CARBON
+    ScriptCode initialScript = rename ? FilenameScript(file) : smRoman;
+    if(initialScript == smCyrillic || GetScriptManagerVariable(smKeyScript) == smCyrillic)
+        NameFieldFont(dialog, smCyrillic);
+    filter = NewModalFilterUPP(NameFilter);
+#endif
     if(rename) {
         SetWTitle(GetDialogWindow(dialog), "\pRename");
         Handle item;
@@ -1476,26 +1841,50 @@ static OSErr AskName(WindowRef window, ConstStr255Param initial, Boolean rename,
                 selected = i - 1;
                 break;
             }
+#if TARGET_API_MAC_CARBON
     SelectDialogItemText(dialog, 4, 0, selected);
+#else
+    SetKeyboardFocus(GetDialogWindow(dialog), edit, kControlFocusNextPart);
+    ControlEditTextSelectionRec selection = {0, selected};
+    SetControlData(edit, kControlEntireControl, kControlEditTextSelectionTag,
+                   sizeof(selection), &selection);
+#endif
     ShowWindow(GetDialogWindow(dialog));
     short item;
     OSErr error;
     for(;;) {
-        ModalDialog(NULL, &item);
+        ModalDialog(filter, &item);
         if(item == 2) {
             error = userCanceledErr;
             break;
         }
         if(item != 1)
             continue;
+#if TARGET_API_MAC_CARBON
         GetDialogItemText(field, name);
+#else
+        Size length = 0;
+        if(GetControlData(edit, kControlEntireControl, kControlEditTextTextTag,
+                          255, name + 1, &length) != noErr || length > 255)
+            length = 0;
+        name[0] = length;
+        *script = GetWRefCon(GetDialogWindow(dialog));
+#endif
         if(rename ? SidebarName(name) : MarkdownName(name)) {
             error = noErr;
             break;
         }
         SysBeep(1);
+#if TARGET_API_MAC_CARBON
         SelectDialogItemText(dialog, 4, 0, 32767);
+#else
+        selection.selEnd = 32767;
+        SetControlData(edit, kControlEntireControl, kControlEditTextSelectionTag,
+                       sizeof(selection), &selection);
+#endif
     }
+    if(filter != NULL)
+        DisposeModalFilterUPP(filter);
     DisposeDialog(dialog);
     SetPortWindowPort(window);
     return error;
@@ -1505,9 +1894,10 @@ static void NewFileInFolder(Editor *editor, WindowRef window, const SidebarEntry
 {
     Workspace *workspace = EditorWorkspace(editor);
     Str255 name;
-    OSErr error = AskName(window, "\pUntitled.md", false, name);
+    ScriptCode script;
+    OSErr error = AskName(window, NULL, name, &script);
     if(error == noErr)
-        error = CreateDocument(editor, window, entry, name);
+        error = CreateDocument(editor, window, entry, name, script);
     if(error == dupFNErr) {
         Status(workspace, window, "\pA file with that name already exists in this folder.");
         SysBeep(1);
@@ -1608,7 +1998,7 @@ const char *WorkspaceSmokeRecovery(Editor *editor, WindowRef window)
     DisposeHandle(check);
     check = NULL;
     result = "FAIL: recovery changed the original or left a snapshot after Save As";
-    if(SaveTo(restored, window, &saved, true) != noErr)
+    if(SaveTo(restored, window, &saved, true, smRoman) != noErr)
         goto done;
     savedWritten = true;
     index = 0;
@@ -1707,7 +2097,7 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     Str255 name = "\pFirst draft";
     if(!MarkdownName(name))
         goto done;
-    OSErr creation = CreateDocument(editor, window, &folder, name);
+    OSErr creation = CreateDocument(editor, window, &folder, name, smRoman);
     if(creation != noErr) {
         static char report[100];
         snprintf(report, sizeof(report), "FAIL: could not create a note in the selected subfolder (%d)", creation);
@@ -1726,8 +2116,28 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     if(workspace->rowCount < 5 || !WorkspaceHasFile(workspace, &workspace->rows[4].file))
         goto done;
     result = "FAIL: creating a duplicate note did not reject the filename";
-    if(CreateDocument(editor, window, &folder, name) != dupFNErr)
+    if(CreateDocument(editor, window, &folder, name, smRoman) != dupFNErr)
         goto done;
+#if !TARGET_API_MAC_CARBON
+    result = "FAIL: creating a Cyrillic filename did not preserve the Unicode catalog name";
+    FSSpec cyrillic = {.vRefNum = folder.file.vRefNum, .parID = nestedID,
+                       .name = "\p\x87\xe0\xec\xe5\xf2\xea\xe0.md"};
+    Handle emptyCyrillic = NewHandle(0);
+    if(emptyCyrillic == NULL)
+        goto done;
+    OSErr createdCyrillic = CreateClassicTextFile(&cyrillic, emptyCyrillic, smCyrillic);
+    DisposeHandle(emptyCyrillic);
+    if(createdCyrillic != noErr)
+        goto done;
+    FSRef ref;
+    HFSUniStr255 unicode;
+    Boolean matchesCyrillic = FSpMakeFSRef(&cyrillic, &ref) == noErr &&
+        FSGetCatalogInfo(&ref, kFSCatInfoNone, NULL, &unicode, NULL, NULL) == noErr &&
+        unicode.length == 10 && memcmp(unicode.unicode, u"Заметка.md", 10 * sizeof(UniChar)) == 0;
+    FSpDelete(&cyrillic);
+    if(!matchesCyrillic)
+        goto done;
+#endif
     result = "FAIL: plain text did not appear in the sidebar or Quick Open search";
     if(FSMakeFSSpec(folder.file.vRefNum, nestedID, "\pPlain notes.txt", &plain) != fnfErr)
         goto done;
@@ -1741,7 +2151,7 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     plainCreated = true;
     WorkspaceRefreshSidebar(workspace, window);
     FSSpec found[4];
-    unsigned matches = WorkspaceSearch(workspace, "\pplain", found, 4);
+    unsigned matches = WorkspaceSearch(workspace, &(SearchField){u"plain", 5}, found, 4);
     if(matches != 1 || !EqualString(found[0].name, plain.name, false, true))
         goto done;
     FSSpec roots[4];
@@ -1753,7 +2163,7 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     SidebarEntry noteEntry = {.kind = kFileRow};
     result = "FAIL: sidebar rename did not retain the open document";
     if(CanTrash(&noteEntry, &note, NULL) ||
-       RenameEntry(&noteEntry, &note, "\pRenamed draft.md") != noErr)
+       RenameEntry(&noteEntry, &note, "\pRenamed draft.md", smRoman) != noErr)
         goto done;
     memcpy(note.name, "\pRenamed draft.md", sizeof("\pRenamed draft.md") - 1);
     Str255 title;
@@ -1763,7 +2173,7 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     SidebarEntry nestedEntry = {.kind = kFolderRow, .directory = nestedID};
     result = "FAIL: folder rename did not preserve the open child document";
     if(CanTrash(&nestedEntry, &nested, NULL) ||
-       RenameEntry(&nestedEntry, &nested, "\pRenamed drafts") != noErr)
+       RenameEntry(&nestedEntry, &nested, "\pRenamed drafts", smRoman) != noErr)
         goto done;
     memcpy(nested.name, "\pRenamed drafts", sizeof("\pRenamed drafts") - 1);
     if(!WorkspaceHasFile(workspace, &note))
@@ -1773,7 +2183,7 @@ static const char *CheckSidebar(Editor *editor, WindowRef window, const FSSpec *
     Str63 trashName;
     trashName[0] = snprintf((char *)trashName + 1, sizeof(trashName) - 1,
                             "Linewren-trash-%08lx.txt", stamp);
-    if(RenameEntry(&noteEntry, &plain, trashName) != noErr)
+    if(RenameEntry(&noteEntry, &plain, trashName, smRoman) != noErr)
         goto done;
     memcpy(plain.name, trashName, trashName[0] + 1);
     FSSpec trash;
@@ -1822,6 +2232,43 @@ done:
     return result;
 }
 
+static const char *CheckFileFormat(Editor *editor, WindowRef window, const FSSpec *file,
+                                   const char *source, unsigned length, Boolean macRoman)
+{
+    Handle bytes;
+    if(PtrToHand(source, &bytes, length) != noErr)
+        return "FAIL: allocate file format fixture";
+    OSErr error = WriteTextFile(file, bytes, NULL);
+    DisposeHandle(bytes);
+    if(error != noErr)
+        return "FAIL: create file format fixture";
+    const char *failure = "FAIL: edit and autosave did not preserve the original file format";
+    Workspace *workspace = EditorWorkspace(editor);
+    if(OpenFile(editor, window, file, macRoman, false) == noErr) {
+        EventRecord edit = {.what = keyDown, .message = '!'};
+        EditorKey(editor, &edit);
+        workspace->editedAt -= kAutosaveDelay;
+        WorkspaceIdle(editor, window);
+        if(ReadTextFile(file, &bytes) == noErr) {
+            unsigned prefix = !macRoman && length >= 3 && (unsigned char)source[0] == 0xef ? 3 : 0;
+            if(!workspace->dirty && GetHandleSize(bytes) == length + 1 &&
+               memcmp(*bytes, source, prefix) == 0 && (*bytes)[prefix] == '!' &&
+               memcmp(*bytes + prefix + 1, source + prefix, length - prefix) == 0) {
+                failure = "FAIL: locked file did not open as read-only";
+                if(FSpSetFLock(file) == noErr) {
+                    WorkspaceReload(editor, window);
+                    if(workspace->readOnly && SameBytes(bytes, workspace->diskBytes))
+                        failure = NULL;
+                    FSpRstFLock(file);
+                }
+            }
+            DisposeHandle(bytes);
+        }
+    }
+    FSpDelete(file);
+    return failure;
+}
+
 const char *WorkspaceSmokeTest(Editor *editor, WindowRef window, WorkspaceSmokeCheck check)
 {
     static const char original[] = "# Notes\n**Bold** and *italic*\n\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82\n";
@@ -1842,6 +2289,13 @@ const char *WorkspaceSmokeTest(Editor *editor, WindowRef window, WorkspaceSmokeC
     second = file;
     second.name[0] = (unsigned char)snprintf((char *)second.name + 1, sizeof(second.name) - 1,
                                             "Linewren-check-%08lx-b.md", stamp);
+    static const char windowsText[] = "\xef\xbb\xbf" "Caf\xc3\xa9\r\nNotes\r\n";
+    static const char macText[] = "Caf\x8e\rNotes\r";
+    result = CheckFileFormat(editor, window, &file, windowsText, sizeof(windowsText) - 1, false);
+    if(result == NULL)
+        result = CheckFileFormat(editor, window, &file, macText, sizeof(macText) - 1, true);
+    if(result != NULL)
+        goto done;
     SetHandleSize(bytes, sizeof(original) - 1);
     if(MemError() != noErr)
         goto done;
@@ -1893,6 +2347,18 @@ const char *WorkspaceSmokeTest(Editor *editor, WindowRef window, WorkspaceSmokeC
         goto done;
     secondCreated = true;
 
+#if TARGET_API_MAC_CARBON
+    result = "FAIL: could not remember separate spelling languages";
+    if(!SpellingSaveFileLanguage(&file, CFSTR("fr")) ||
+       !SpellingSaveFileLanguage(&second, CFSTR("en")))
+        goto done;
+#else
+    result = "FAIL: could not remember Russian for the first document";
+    EditorSetSpellingLanguage(editor, kSpellingRussian);
+    if(!WorkspaceRememberSpelling(editor))
+        goto done;
+#endif
+
     result = "FAIL: switching files did not replace the document in place";
     Str255 title;
     if(WorkspaceOpen(editor, window, &second) != noErr)
@@ -1902,10 +2368,31 @@ const char *WorkspaceSmokeTest(Editor *editor, WindowRef window, WorkspaceSmokeC
        !WorkspaceHasFile(workspace, &second) || !EditorIsEmpty(editor) ||
        EditorCanUndo(editor) || workspace->dirty || workspace->pending)
         goto done;
+#if TARGET_API_MAC_CARBON
+    result = "FAIL: switching to the second document did not load English";
+    if(EditorSpellingOverride(editor) == NULL || !CFEqual(EditorSpellingOverride(editor), CFSTR("en")))
+        goto done;
+#else
+    result = "FAIL: opening the second document inherited Russian";
+    if(EditorSpellingLanguage(editor) != kSpellingEnglish)
+        goto done;
+#endif
 
     result = "FAIL: switching files lost edits that were waiting to autosave";
     if(WorkspaceOpen(editor, window, &file) != noErr || !SameBytes(saved, workspace->diskBytes))
         goto done;
+#if TARGET_API_MAC_CARBON
+    result = "FAIL: reopening the first document did not restore French";
+    if(EditorSpellingOverride(editor) == NULL || !CFEqual(EditorSpellingOverride(editor), CFSTR("fr")))
+        goto done;
+#else
+    result = "FAIL: reopening the first document did not restore Russian";
+    if(EditorSpellingLanguage(editor) != kSpellingRussian)
+        goto done;
+    EditorSetSpellingLanguage(editor, kSpellingEnglish);
+    if(!WorkspaceRememberSpelling(editor))
+        goto done;
+#endif
 
     SetHandleSize(bytes, sizeof(original) - 1);
     if(MemError() != noErr)
@@ -1921,17 +2408,25 @@ const char *WorkspaceSmokeTest(Editor *editor, WindowRef window, WorkspaceSmokeC
     if(!workspace->diskChanged || workspace->dirty || workspace->pending ||
        !SameBytes(saved, workspace->diskBytes))
         goto done;
-    result = "FAIL: the external-change warning did not clear when the disk copy matched again";
-    if(WriteTextFile(&file, saved, bytes) != noErr)
-        goto done;
-    WorkspaceCheckExternal(workspace, window, true);
-    if(workspace->diskChanged)
+    result = "FAIL: Reload from Disk did not adopt the external change";
+    WorkspaceReload(editor, window);
+    if(workspace->diskChanged || !SameBytes(bytes, workspace->diskBytes) || EditorCanUndo(editor))
         goto done;
     result = CheckSidebar(editor, window, &file, check);
     if(result == NULL)
         result = "LINEWREN_WORKSPACE_SMOKE_OK";
 
 done:
+#if TARGET_API_MAC_CARBON
+    if(secondCreated)
+        SpellingSaveFileLanguage(&second, NULL);
+    if(created)
+        SpellingSaveFileLanguage(&file, NULL);
+#else
+    FSSpec preference;
+    if(created && SpellingPreference(&file, &preference) == noErr)
+        FSpDelete(&preference);
+#endif
     if(secondCreated)
         FSpDelete(&second);
     if(created)

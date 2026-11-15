@@ -59,10 +59,16 @@ int DocumentMatchesAt(DocumentQuery query, size_t offset)
 {
     if(query.queryLength == 0 || offset > query.length || query.queryLength > query.length - offset)
         return 0;
-    for(size_t i = 0; i < query.queryLength; ++i)
-        if(Fold(query.text[offset + i]) != Fold(query.query[i]))
+    int unicode = 0;
+    for(size_t i = 0; i < query.queryLength; ++i) {
+        unsigned left = query.text[offset + i], right = query.query[i];
+        if(Fold(left) == Fold(right))
+            continue;
+        if((left | right) < 0x80 || query.unicodeEqual == NULL)
             return 0;
-    return 1;
+        unicode = 1;
+    }
+    return !unicode || query.unicodeEqual(query.text + offset, query.query, query.queryLength);
 }
 
 size_t DocumentNextMatch(DocumentQuery query, size_t offset)

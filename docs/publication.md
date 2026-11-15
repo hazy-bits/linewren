@@ -8,12 +8,12 @@
   and uploads the Mac OS 9 ZIP and the Tiger and Leopard DMGs. Untagged CI builds
   add `-dev.<run>.<attempt>` to the version in the app and archive names.
 - When the commit is ready to release, tag it with `v` followed by its
-  `VERSION`. For the first release, use `v0.2.0`.
+  `VERSION`. Run these commands from the checkout after pushing the release commit.
 
   ```sh
-  git fetch origin main
-  git tag -a v0.2.0 origin/main -m "Linewren 0.2.0"
-  git push origin v0.2.0
+  version=$(cat VERSION)
+  git tag -a "v$version" -m "Linewren $version"
+  git push origin "v$version"
   ```
 
   GitHub Actions checks the tag, builds all three archives with the release

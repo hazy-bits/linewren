@@ -4,16 +4,21 @@
 #include "text-files.h"
 #include "workspace.h"
 #if TARGET_API_MAC_CARBON
+#include "spelling.h"
 #include <CarbonEvents.h>
 #include <CFURL.h>
 #include <Navigation.h>
 #else
 #include <InputSprocket.h>
+#include <LowMem.h>
 #include <StandardFile.h>
 #endif
 
 #include <Devices.h>
 #include <AppleEvents.h>
+#include <AERegistry.h>
+#include <ATSUnicode.h>
+#include <TextServices.h>
 #include <Dialogs.h>
 #include <Drag.h>
 #include <Events.h>
@@ -45,12 +50,15 @@ enum {
     kFontMenu = 133,
     kSizeMenu = 134,
     kWindowMenu = 137,
-    kRecentMenu = 138
+    kRecentMenu = 138,
+    kSpellingMenu = 139
 };
 
 enum { kFindItem = 12, kFindNextItem = 13, kFindPreviousItem = 14, kReplaceItem = 15 };
-static Str255 gFindText;
-static Str255 gReplaceText;
+enum { kSpellingItem = kTaskItem + 2 };
+enum { kReviewSpelling = 1, kCheckSpelling, kLiveSpelling };
+static SearchField gFindText;
+static SearchField gReplaceText;
 enum { kFindRow = 24 };
 static struct {
     WindowRef window;
@@ -58,7 +66,10 @@ static struct {
     unsigned caret, count, ordinal;
 } gFind;
 static void CloseFind(void);
+static void SpellingLanguageLabel(Editor *editor, Str255 label);
+static Boolean ChooseSpellingLanguage(Editor *editor, WindowRef window, Point point);
 static Rect FindBounds(WindowRef window);
+static TSMDocumentID gTextInput;
 
 enum {
     kAboutItem = 1,
@@ -70,7 +81,9 @@ enum {
     kCloseItem = 7,
     kSaveItem = 8,
     kSaveAsItem = 9,
-    kQuitItem = 11
+    kOpenMacRomanItem = 11,
+    kReloadItem = 12,
+    kQuitItem = 14
 };
 
 #if TARGET_API_MAC_CARBON
@@ -84,14 +97,20 @@ static OSStatus ZoomDocument(WindowRef window, short part);
 static Rect gNextWindowRect;
 static Boolean gRunning = true;
 static AppSettings gSettings;
+#if TARGET_API_MAC_CARBON
+static RgnHandle gPaintRegion;
+#endif
 
 enum { kQuickResultLimit = 8, kQuickRowHeight = 18, kQuickFieldHeight = 28 };
 enum { kPanelInset = 6, kPanelWidth = 360 };
 static struct {
     Boolean visible;
     WindowRef window;
-    Str63 query;
+    SearchField query;
     FSSpec files[kQuickResultLimit];
+#if !TARGET_API_MAC_CARBON
+    short filenameFonts[kQuickResultLimit];
+#endif
     unsigned count;
     unsigned selected;
 } gQuickOpen;
@@ -260,13 +279,17 @@ static Boolean InitDocumentMenus(void)
 {
     gWindowMenu = GetMenu(kWindowMenu);
     gRecentMenu = NewMenu(kRecentMenu, "\pOpen Recent");
-    if(gWindowMenu == NULL || gRecentMenu == NULL)
+    MenuRef spelling = GetMenu(kSpellingMenu);
+    if(gWindowMenu == NULL || gRecentMenu == NULL || spelling == NULL)
         return false;
 #if TARGET_API_MAC_CARBON
     InsertMenuItem(gWindowMenu, "\pMinimize/M", 0);
 #endif
     InsertMenu(gWindowMenu, 0);
     InsertMenu(gRecentMenu, hierMenu);
+    InsertMenu(spelling, hierMenu);
+    if(SetMenuItemHierarchicalID(GetMenuHandle(kEditMenu), kSpellingItem, kSpellingMenu) != noErr)
+        return false;
     SetMenuItemHierarchicalID(GetMenu(kFileMenu), kOpenRecentItem, kRecentMenu);
     SetMenuItemModifiers(GetMenu(kFileMenu), kSaveAsItem, kMenuShiftModifier);
     SetMenuItemModifiers(GetMenu(kEditMenu), kRedoItem, kMenuShiftModifier);
@@ -280,12 +303,24 @@ static void AppendMenuLabel(MenuRef menu, ConstStr255Param label)
     SetMenuItemText(menu, CountMenuItems(menu), label);
 }
 
+static void AppendFilenameLabel(MenuRef menu, ConstStr255Param label, const FSSpec *file)
+{
+    AppendMenuLabel(menu, label);
+#if !TARGET_API_MAC_CARBON
+    short font = WorkspaceFilenameFont(file);
+    if(font > 0)
+        SetMenuItemFontID(menu, CountMenuItems(menu), font);
+#else
+    (void)file;
+#endif
+}
+
 static void RefreshDocumentMenus(void)
 {
     while(CountMenuItems(gRecentMenu) > 0)
         DeleteMenuItem(gRecentMenu, CountMenuItems(gRecentMenu));
     for(unsigned i = 0; i < gSettings.recentCount; ++i)
-        AppendMenuLabel(gRecentMenu, gSettings.recent[i].name);
+        AppendFilenameLabel(gRecentMenu, gSettings.recent[i].name, &gSettings.recent[i]);
     if(gSettings.recentCount > 0)
         AppendMenu(gRecentMenu, "\p-;Clear Menu");
 
@@ -293,9 +328,20 @@ static void RefreshDocumentMenus(void)
         DeleteMenuItem(gWindowMenu, CountMenuItems(gWindowMenu));
     for(WindowRef window = FirstWindow(); window != NULL; window = GetNextWindow(window)) {
         if(GetDocument(window) != NULL) {
-            Str255 title;
-            GetWTitle(window, title);
-            AppendMenuLabel(gWindowMenu, title);
+#if TARGET_API_MAC_CARBON
+            CFStringRef unicodeTitle;
+            if(CopyWindowTitleAsCFString(window, &unicodeTitle) == noErr) {
+                AppendMenu(gWindowMenu, "\pX");
+                SetMenuItemTextWithCFString(gWindowMenu, CountMenuItems(gWindowMenu), unicodeTitle);
+                CFRelease(unicodeTitle);
+            } else
+#endif
+            {
+                Str255 title;
+                GetWTitle(window, title);
+                AppendFilenameLabel(gWindowMenu, title,
+                    WorkspaceCurrentFile(EditorWorkspace(GetDocument(window))));
+            }
             CheckMenuItem(gWindowMenu, CountMenuItems(gWindowMenu), window == FrontWindow());
         }
     }
@@ -368,6 +414,44 @@ static void ApplyViewLayout(void)
     UpdateThemeMenu();
 }
 
+#if !TARGET_API_MAC_CARBON
+static Handle gDocumentWDEF;
+static Handle gTitleWDEF;
+
+static pascal long DocumentWDEF(short variant, WindowRef window, short message, long parameter)
+{
+    Editor *editor = GetDocument(window);
+    short font = editor != NULL ? WorkspaceTitleFont(EditorWorkspace(editor)) : 0;
+    short original = 0;
+    /* The Classic window definition takes its title font from the system font. */
+    if(font > 0) {
+        original = LMGetSysFontFam();
+        LMSetSysFontFam(font);
+    }
+    long result = InvokeWindowDefUPP(variant, window, message, parameter,
+                                    (WindowDefUPP)*gDocumentWDEF);
+    if(font > 0)
+        LMSetSysFontFam(original);
+    return result;
+}
+
+static void InstallDocumentWDEF(WindowRef window)
+{
+    WindowPeek record = (WindowPeek)window;
+    if(gTitleWDEF == NULL) {
+        static const RoutineDescriptor descriptor =
+            BUILD_ROUTINE_DESCRIPTOR(uppWindowDefProcInfo, DocumentWDEF);
+        if(PtrToHand(&descriptor, &gTitleWDEF, sizeof(descriptor)) == noErr)
+            HLock(gTitleWDEF);
+    }
+    if(gTitleWDEF != NULL) {
+        if(gDocumentWDEF == NULL)
+            gDocumentWDEF = record->windowDefProc;
+        record->windowDefProc = gTitleWDEF;
+    }
+}
+#endif
+
 static WindowRef NewDocument(OSStatus *outStatus)
 {
     WindowRef window;
@@ -410,11 +494,15 @@ static WindowRef NewDocument(OSStatus *outStatus)
     }
 
     SetWRefCon(window, (long)editor);
+#if !TARGET_API_MAC_CARBON
+    InstallDocumentWDEF(window);
+#endif
     EditorSetTheme(editor, &kThemes[gTheme - 1]);
     WorkspaceRestoreFolders(EditorWorkspace(editor), window,
                             gSettings.roots, gSettings.rootCount);
     EditorSetTypography(editor, gTypography);
     EditorSetTypewriter(editor, gSettings.typewriter);
+    EditorSetLiveSpelling(editor, gSettings.liveSpelling);
     Rect outline = OutlineBounds(view);
     if(!EmptyRect(&outline))
         EditorResize(editor, &view, &outline);
@@ -510,6 +598,10 @@ static void CloseDocument(WindowRef window)
         CaptureWindowSettings(window);
         SetPortWindowPort(window);
         WorkspaceFinishDocument(EditorWorkspace(editor));
+#if !TARGET_API_MAC_CARBON
+        if(gTitleWDEF != NULL)
+            ((WindowPeek)window)->windowDefProc = gDocumentWDEF;
+#endif
         EditorDelete(editor);
     }
     DisposeWindow(window);
@@ -532,7 +624,7 @@ static void RememberDocument(Editor *editor)
         SettingsRememberFile(&gSettings, file);
 }
 
-static OSErr OpenDocument(WindowRef source, const FSSpec *file)
+static OSErr OpenDocumentWithEncoding(WindowRef source, const FSSpec *file, Boolean macRoman)
 {
     CloseFind();
     for(WindowRef window = FirstWindow(); window != NULL; window = GetNextWindow(window)) {
@@ -550,7 +642,8 @@ static OSErr OpenDocument(WindowRef source, const FSSpec *file)
     Editor *editor = GetDocument(source);
     if(editor == NULL)
         return memFullErr;
-    OSErr error = WorkspaceOpen(editor, source, file);
+    OSErr error = macRoman ? WorkspaceOpenMacRoman(editor, source, file) :
+                             WorkspaceOpen(editor, source, file);
     if(error == noErr) {
         RememberDocument(editor);
     } else {
@@ -565,7 +658,12 @@ static OSErr OpenDocument(WindowRef source, const FSSpec *file)
     return error;
 }
 
-static void ChooseDocument(WindowRef window)
+static OSErr OpenDocument(WindowRef source, const FSSpec *file)
+{
+    return OpenDocumentWithEncoding(source, file, false);
+}
+
+static void ChooseDocument(WindowRef window, Boolean macRoman)
 {
     FSSpec file;
 #if TARGET_API_MAC_CARBON
@@ -594,7 +692,7 @@ static void ChooseDocument(WindowRef window)
         return;
     file = reply.sfFile;
 #endif
-    OpenDocument(GetDocument(window) != NULL ? window : NULL, &file);
+    OpenDocumentWithEncoding(GetDocument(window) != NULL ? window : NULL, &file, macRoman);
 }
 
 static Rect QuickOpenBounds(WindowRef window)
@@ -916,9 +1014,13 @@ static void RefreshQuickOpen(void)
     Editor *editor = GetDocument(gQuickOpen.window);
     if(editor == NULL)
         return;
-    gQuickOpen.count = gQuickOpen.query[0] == 0 ? 0 :
-        WorkspaceSearch(EditorWorkspace(editor), gQuickOpen.query,
+    gQuickOpen.count = gQuickOpen.query.length == 0 ? 0 :
+        WorkspaceSearch(EditorWorkspace(editor), &gQuickOpen.query,
                         gQuickOpen.files, kQuickResultLimit);
+#if !TARGET_API_MAC_CARBON
+    for(unsigned i = 0; i < gQuickOpen.count; ++i)
+        gQuickOpen.filenameFonts[i] = WorkspaceFilenameFont(&gQuickOpen.files[i]);
+#endif
     if(gQuickOpen.count == 0)
         gQuickOpen.selected = 0;
     else if(gQuickOpen.selected >= gQuickOpen.count)
@@ -1012,10 +1114,15 @@ static void ShowAboutBox(void)
 static void UpdateMenus(void)
 {
     MenuRef fileMenu = GetMenu(kFileMenu);
-    MenuRef editMenu = GetMenu(kEditMenu);
+    MenuRef editMenu = GetMenuHandle(kEditMenu);
     WindowRef window = FrontWindow();
     Editor *editor = GetDocument(window);
     Boolean hasEditor = editor != NULL;
+    CheckMenuItem(GetMenuHandle(kSpellingMenu), kLiveSpelling, gSettings.liveSpelling);
+    if(hasEditor)
+        EnableMenuItem(editMenu, kSpellingItem);
+    else
+        DisableMenuItem(editMenu, kSpellingItem);
 
     if(gSettings.recentCount > 0)
         EnableMenuItem(fileMenu, kOpenRecentItem);
@@ -1051,6 +1158,10 @@ static void UpdateMenus(void)
         DisableMenuItem(fileMenu, kQuickOpenItem);
     }
     EnableMenuItem(fileMenu, kOpenItem);
+    if(hasEditor && WorkspaceCurrentFile(EditorWorkspace(editor)) != NULL)
+        EnableMenuItem(fileMenu, kReloadItem);
+    else
+        DisableMenuItem(fileMenu, kReloadItem);
 
     if(hasEditor) {
         EnableMenuItem(editMenu, kCutItem);
@@ -1128,7 +1239,7 @@ static void CloseFind(void)
 static void RunFind(WindowRef window, short direction)
 {
     SetPortWindowPort(window);
-    gFind.count = EditorSearch(GetDocument(window), gFindText, direction, &gFind.ordinal);
+    gFind.count = EditorSearch(GetDocument(window), &gFindText, direction, &gFind.ordinal);
     Rect bounds = FindBounds(window);
     InvalidateRect(&bounds);
 }
@@ -1136,7 +1247,7 @@ static void RunFind(WindowRef window, short direction)
 static void FocusFindField(Boolean replace)
 {
     gFind.replaceField = replace;
-    gFind.caret = replace ? gReplaceText[0] : gFindText[0];
+    gFind.caret = replace ? gReplaceText.length : gFindText.length;
     gFind.selectAll = gFind.caret != 0;
 }
 
@@ -1158,7 +1269,7 @@ static void ReplaceFound(Boolean all)
         return;
     WindowRef window = gFind.window;
     SetPortWindowPort(window);
-    EditorReplaceText(GetDocument(window), gFindText, gReplaceText, all);
+    EditorReplaceText(GetDocument(window), &gFindText, &gReplaceText, all);
     RunFind(window, 0);
 }
 
@@ -1193,7 +1304,7 @@ static void DrawPanel(Rect bounds, const EditorTheme *theme)
     TextMode(srcCopy);
 }
 
-static void DrawPanelField(Rect field, ConstStr255Param text, ConstStr255Param hint,
+static void DrawPanelField(Rect field, const SearchField *text, ConstStr255Param hint,
                            unsigned caret, Boolean focused, Boolean selected,
                            const EditorTheme *theme)
 {
@@ -1203,25 +1314,62 @@ static void DrawPanelField(Rect field, ConstStr255Param text, ConstStr255Param h
     RGBForeColor(focused ? &focus : &theme->divider);
     FrameRect(&field);
     short width = field.right - field.left - 10;
-    unsigned start = 0, end = text[0];
-    caret = focused ? caret : 0;
-    while(start < caret && TextWidth(text + 1, start, caret - start) > width)
-        ++start;
-    while(end > caret && TextWidth(text + 1, start, end - start) > width)
-        --end;
     short x = field.left + 5, baseline = field.bottom - 5;
-    RGBForeColor(text[0] ? &theme->text : &theme->secondary);
-    MoveTo(x, baseline);
-    if(text[0] == 0)
+    short textWidth = 0, caretX = -2;
+    if(text->length == 0) {
+        RGBForeColor(&theme->secondary);
+        MoveTo(x, baseline);
         DrawString(hint);
-    else
-        DrawText(text + 1, start, end - start);
+    } else {
+        ATSUStyle style;
+        if(ATSUCreateStyle(&style) == noErr) {
+            ATSUFontID font;
+            Fixed size = 11L << 16;
+            ATSUAttributeTag tags[] = {kATSUFontTag, kATSUSizeTag, kATSUColorTag};
+            ByteCount sizes[] = {sizeof(font), sizeof(size), sizeof(theme->text)};
+            ATSUAttributeValuePtr values[] = {&font, &size, (void *)&theme->text};
+            ATSUTextLayout layout;
+            UniCharCount length = text->length;
+            if(ATSUFONDtoFontID(WorkspaceLabelFont(), normal, &font) == noErr &&
+               ATSUSetAttributes(style, 3, tags, sizes, values) == noErr &&
+               ATSUCreateTextLayoutWithTextPtr(text->text, 0, length, length, 1, &length,
+                                               &style, &layout) == noErr) {
+                ATSUSetTransientFontMatching(layout, true);
+                ATSUTextMeasurement after;
+                if(ATSUMeasureText(layout, 0, length, NULL, &after, NULL, NULL) == noErr)
+                    textWidth = after >> 16;
+                if(focused && caret != 0) {
+                    ATSUCaret position, other;
+                    Boolean split;
+                    if(ATSUOffsetToPosition(layout, caret, caret < length, &position, &other, &split) == noErr)
+                        caretX = position.fX >> 16;
+                }
+                short scroll = caretX > width ? caretX - width : 0;
+                RgnHandle clip = NewRgn();
+                if(clip != NULL) {
+                    Rect inner = field;
+                    InsetRect(&inner, 3, 1);
+                    GetClip(clip);
+                    ClipRect(&inner);
+                    ATSUDrawText(layout, 0, length, (Fixed)(x - scroll) * 65536,
+                                 (Fixed)baseline * 65536);
+                    SetClip(clip);
+                    DisposeRgn(clip);
+                }
+                caretX -= scroll;
+                ATSUDisposeTextLayout(layout);
+            }
+            ATSUDisposeStyle(style);
+        }
+    }
+    if(textWidth > width)
+        textWidth = width;
     if(focused && selected) {
         Rect selection = {field.top + 2, x, field.bottom - 2,
-                          x + TextWidth(text + 1, start, end - start)};
+                          x + textWidth};
         InvertRect(&selection);
     } else if(focused) {
-        x += text[0] == 0 ? -2 : TextWidth(text + 1, start, caret - start);
+        x += caretX;
         Rect cursor = {field.top + 3, x, field.bottom - 3, x + 2};
         RGBForeColor(&theme->caret);
         PaintRect(&cursor);
@@ -1232,10 +1380,10 @@ static void DrawFind(WindowRef window, const EditorTheme *theme)
 {
     Rect bounds = FindBounds(window);
     DrawPanel(bounds, theme);
-    DrawPanelField(FindField(bounds, false), gFindText, "\pFind",
+    DrawPanelField(FindField(bounds, false), &gFindText, "\pFind",
                    gFind.caret, !gFind.replaceField, gFind.selectAll, theme);
     if(gFind.expanded)
-        DrawPanelField(FindField(bounds, true), gReplaceText, "\pReplace",
+        DrawPanelField(FindField(bounds, true), &gReplaceText, "\pReplace",
                        gFind.caret, gFind.replaceField, gFind.selectAll, theme);
     RGBBackColor(&theme->panel);
     RGBForeColor(&theme->text);
@@ -1246,7 +1394,7 @@ static void DrawFind(WindowRef window, const EditorTheme *theme)
     if(gFind.count)
         status[0] = snprintf((char *)status + 1, sizeof(status) - 1, "%u/%u",
                              gFind.ordinal, gFind.count);
-    else if(gFindText[0])
+    else if(gFindText.length)
         memcpy(status, "\pNo matches", 11);
     MoveTo(bounds.right - 121, baseline);
     DrawString(status);
@@ -1300,23 +1448,26 @@ static void ClickFind(Rect bounds, Point point)
     }
 }
 
-static void EditFindText(StringPtr text, const unsigned char *insert, unsigned length,
-                         unsigned remove)
+static unsigned FieldPrevious(const SearchField *field, unsigned offset)
 {
-    unsigned start = gFind.caret;
-    if(gFind.selectAll) {
-        start = 0;
-        remove = text[0];
-    } else {
-        start -= remove;
-    }
-    unsigned remaining = text[0] - start - remove;
-    if(length > 255 - start - remaining)
-        length = 255 - start - remaining;
-    memmove(text + 1 + start + length, text + 1 + start + remove, remaining);
-    if(length)
-        memcpy(text + 1 + start, insert, length);
-    text[0] = start + length + remaining;
+    if(offset == 0)
+        return 0;
+    return offset - ((field->text[offset - 1] & 0xfc00) == 0xdc00 ? 2 : 1);
+}
+
+static void EditFindText(SearchField *field, const UniChar *insert, unsigned length, unsigned remove)
+{
+    unsigned start = gFind.selectAll ? 0 : gFind.caret - remove;
+    if(gFind.selectAll)
+        remove = field->length;
+    unsigned remaining = field->length - start - remove;
+    if(length > kSearchFieldLimit - start - remaining)
+        return;
+    memmove(field->text + start + length, field->text + start + remove,
+            remaining * sizeof(UniChar));
+    if(length != 0)
+        memcpy(field->text + start, insert, length * sizeof(UniChar));
+    field->length = start + length + remaining;
     gFind.caret = start + length;
     gFind.selectAll = false;
     RunFind(gFind.window, 0);
@@ -1329,24 +1480,40 @@ static Boolean FindKey(const EventRecord *event)
         return false;
     SetPortWindowPort(window);
     unsigned char key = event->message & charCodeMask;
-    StringPtr text = gFind.replaceField ? gReplaceText : gFindText;
+    SearchField *text = gFind.replaceField ? &gReplaceText : &gFindText;
     if(event->modifiers & cmdKey) {
         if(key == 'a' || key == 'A') {
             FocusFindField(gFind.replaceField);
         } else if(key == 'v' || key == 'V') {
-            if(ReadScrap(NULL, 'TEXT') > 0) {
-                Handle scrap = NewHandle(0);
-                if(scrap != NULL) {
-                    long size = ReadScrap(scrap, 'TEXT');
-                    HLock(scrap);
-                    const unsigned char *bytes = (const unsigned char *)*scrap;
-                    unsigned length = 0;
-                    while((long)length < size && length < 255 && bytes[length] >= ' ')
-                        ++length;
-                    if(length)
-                        EditFindText(text, bytes, length, 0);
-                    DisposeHandle(scrap);
+            Handle scrap = NewHandle(0);
+            if(scrap != NULL) {
+                long size = ReadScrap(scrap, 'utxt');
+                UniChar roman[kSearchFieldLimit];
+                const UniChar *input = (const UniChar *)*scrap;
+                unsigned count = 0;
+                if(size > 0 && size % sizeof(UniChar) == 0) {
+                    count = size / sizeof(UniChar);
+                    if(count != 0 && *input == 0xfeff) {
+                        ++input;
+                        --count;
+                    }
+                } else {
+                    size = ReadScrap(scrap, 'TEXT');
+                    if(size > 0 && size <= kSearchFieldLimit)
+                        count = EditorDecodeRoman(*scrap, size, roman);
+                    input = roman;
                 }
+                unsigned length = 0;
+                while(length < count && length < kSearchFieldLimit && input[length] >= ' ')
+                    ++length;
+                if(length != 0 && (input[length - 1] & 0xfc00) == 0xd800)
+                    --length;
+                if(length != 0) {
+                    HLock(scrap);
+                    EditFindText(text, input, length, 0);
+                    HUnlock(scrap);
+                }
+                DisposeHandle(scrap);
             }
         } else if(key == 'g' || key == 'G') {
             RunFind(window, (event->modifiers & shiftKey) ? -1 : 1);
@@ -1367,16 +1534,18 @@ static Boolean FindKey(const EventRecord *event)
         RunFind(window, key == 0x1e ? -1 : 1);
     } else if(key == 0x1c || key == 0x1d) {
         if(gFind.selectAll)
-            gFind.caret = key == 0x1c ? 0 : text[0];
+            gFind.caret = key == 0x1c ? 0 : text->length;
         else if(key == 0x1c && gFind.caret > 0)
-            --gFind.caret;
-        else if(key == 0x1d && gFind.caret < text[0])
-            ++gFind.caret;
+            gFind.caret = FieldPrevious(text, gFind.caret);
+        else if(key == 0x1d && gFind.caret < text->length)
+            gFind.caret += (text->text[gFind.caret] & 0xfc00) == 0xd800 ? 2 : 1;
         gFind.selectAll = false;
     } else if(key == 8) {
-        EditFindText(text, NULL, 0, gFind.caret != 0);
+        EditFindText(text, NULL, 0, gFind.caret - FieldPrevious(text, gFind.caret));
     } else if(key >= ' ' && key != 127) {
-        EditFindText(text, &key, 1, 0);
+        UniChar ch;
+        if(EditorDecodeKey(key, &ch))
+            EditFindText(text, &ch, 1, 0);
     }
     Rect bounds = FindBounds(window);
     InvalidateRect(&bounds);
@@ -1480,18 +1649,22 @@ static void DoMenuCommand(long command)
                 break;
             case kOpenFolderItem:
             case kOpenItem:
+            case kOpenMacRomanItem:
+            case kReloadItem:
             case kQuickOpenItem:
             case kSaveItem:
             case kSaveAsItem: {
                 window = FrontWindow();
                 Editor *editor = GetDocument(window);
-                if(item == kOpenItem) {
-                    ChooseDocument(window);
+                if(item == kOpenItem || item == kOpenMacRomanItem) {
+                    ChooseDocument(window, item == kOpenMacRomanItem);
                 } else if(editor != NULL) {
                     if(item == kQuickOpenItem)
                         ShowQuickOpen(window);
                     else if(item == kOpenFolderItem)
                         WorkspaceChooseFolder(EditorWorkspace(editor), window);
+                    else if(item == kReloadItem)
+                        WorkspaceReload(editor, window);
                     else if(WorkspaceSave(editor, window, item == kSaveAsItem))
                         RememberDocument(editor);
                 }
@@ -1503,13 +1676,35 @@ static void DoMenuCommand(long command)
         Editor *editor = GetDocument(front);
         if(editor != NULL && (item == kFindItem || item == kReplaceItem)) {
             if(item == kFindItem && gFind.window != front)
-                EditorFindSelection(editor, gFindText);
+                EditorFindSelection(editor, &gFindText);
             ShowFind(front, item == kReplaceItem);
         } else if(editor != NULL && (item == kFindNextItem || item == kFindPreviousItem))
             RunFind(front, item == kFindPreviousItem ? -1 : 1);
         else
             DoEditCommand(item);
         if(editor != NULL) {
+            SetPortWindowPort(front);
+            InvalidateFooter(front);
+        }
+    } else if(menu == kSpellingMenu) {
+        WindowRef front = FrontWindow();
+        Editor *editor = GetDocument(front);
+        if(editor != NULL) {
+            HiliteMenu(0);
+            SetPortWindowPort(front);
+            if(item == kReviewSpelling)
+                EditorReviewSpelling(editor, front, SpellingLanguageLabel, ChooseSpellingLanguage);
+            else if(item == kCheckSpelling)
+                EditorCheckSpelling(editor, front);
+            else if(item == kLiveSpelling) {
+                gSettings.liveSpelling = !gSettings.liveSpelling;
+                for(WindowRef window = FirstWindow(); window != NULL; window = GetNextWindow(window)) {
+                    Editor *document = GetDocument(window);
+                    if(document != NULL)
+                        EditorSetLiveSpelling(document, gSettings.liveSpelling);
+                }
+                SettingsSave(&gSettings);
+            }
             SetPortWindowPort(front);
             InvalidateFooter(front);
         }
@@ -1618,6 +1813,128 @@ static void FooterCounter(Editor *editor, Str255 label)
                         characters ? "character" : "word", count == 1 ? "" : "s");
 }
 
+#if TARGET_API_MAC_CARBON
+static CFStringRef LanguageName(CFStringRef language)
+{
+    const struct { CFStringRef code, name; } names[] = {
+        {CFSTR("en"), CFSTR("English")}, {CFSTR("en_US"), CFSTR("English (US)")},
+        {CFSTR("en_GB"), CFSTR("English (UK)")}, {CFSTR("en_AU"), CFSTR("English (Australia)")},
+        {CFSTR("en_CA"), CFSTR("English (Canada)")}, {CFSTR("nl"), CFSTR("Dutch")},
+        {CFSTR("fr"), CFSTR("French")}, {CFSTR("de"), CFSTR("German")},
+        {CFSTR("it"), CFSTR("Italian")}, {CFSTR("pt"), CFSTR("Portuguese")},
+        {CFSTR("pt_PT"), CFSTR("Portuguese (Portugal)")}, {CFSTR("pt_BR"), CFSTR("Portuguese (Brazil)")},
+        {CFSTR("es"), CFSTR("Spanish")}, {CFSTR("sv"), CFSTR("Swedish")},
+        {CFSTR("Multilingual"), CFSTR("Multilingual")}
+    };
+    for(unsigned i = 0; i < sizeof(names) / sizeof(*names); ++i) {
+        if(CFEqual(language, names[i].code))
+            return names[i].name;
+    }
+    return language;
+}
+#endif
+
+static void SpellingLanguageLabel(Editor *editor, Str255 label)
+{
+    label[0] = 0;
+#if TARGET_API_MAC_CARBON
+    CFStringRef language = EditorSpellingLanguage(editor);
+    if(language != NULL &&
+       !CFStringGetPascalString(LanguageName(language), label, 256, kCFStringEncodingMacRoman) &&
+       !CFStringGetPascalString(language, label, 256, kCFStringEncodingMacRoman))
+        memcpy(label, "\pSpelling Language", sizeof("\pSpelling Language"));
+#else
+    ConstStr255Param name = EditorSpellingLanguage(editor) == kSpellingRussian ? "\pRussian" : "\pEnglish (US)";
+    memcpy(label, name, name[0] + 1);
+#endif
+}
+
+static void FooterLanguage(Editor *editor, Str255 label)
+{
+    if(gFocusMode)
+        label[0] = 0;
+    else
+        SpellingLanguageLabel(editor, label);
+}
+
+#if !TARGET_API_MAC_CARBON
+static void AppendClassicSpellingLanguages(MenuRef menu)
+{
+    AppendMenu(menu, "\pEnglish;Russian");
+    SetMenuItemText(menu, 1, "\pEnglish (US)");
+}
+#endif
+
+static Boolean ChooseSpellingLanguage(Editor *editor, WindowRef window, Point point)
+{
+    MenuRef menu = NewMenu(140, "\pSpelling Language");
+    if(menu == NULL)
+        return false;
+    short selected = 1;
+#if TARGET_API_MAC_CARBON
+    CFArrayRef languages = SpellingCopyLanguages();
+    CFStringRef current = EditorSpellingLanguage(editor);
+    CFMutableArrayRef choices = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    if(languages != NULL && choices != NULL) {
+        for(CFIndex i = 0; i < CFArrayGetCount(languages); ++i) {
+            CFStringRef language = CFArrayGetValueAtIndex(languages, i);
+            OSStatus error = AppendMenuItemTextWithCFString(menu, LanguageName(language), 0, 0, NULL);
+            if(error != noErr)
+                continue;
+            CFArrayAppendValue(choices, language);
+            if(current != NULL && CFEqual(current, language))
+                selected = CountMenuItems(menu);
+        }
+    }
+#else
+    selected = EditorSpellingLanguage(editor) == kSpellingRussian ? 2 : 1;
+    AppendClassicSpellingLanguages(menu);
+#endif
+    short item = 0;
+    if(CountMenuItems(menu) != 0) {
+        CheckMenuItem(menu, selected, true);
+        InsertMenu(menu, hierMenu);
+        long choice = PopUpMenuSelect(menu, point.v, point.h, selected);
+        if((choice >> 16) == 140)
+            item = (short)choice;
+        DeleteMenu(140);
+    }
+    DisposeMenu(menu);
+    Boolean changed = false;
+#if TARGET_API_MAC_CARBON
+    if(item > 0 && choices != NULL && item <= CFArrayGetCount(choices)) {
+        CFStringRef language = CFArrayGetValueAtIndex(choices, item - 1);
+        CFStringRef override = EditorSpellingOverride(editor);
+        if(override == NULL || !CFEqual(override, language)) {
+            if(SpellingLanguageSupported(language)) {
+                changed = current == NULL || !CFEqual(current, language);
+                EditorSetSpellingLanguage(editor, language);
+                const FSSpec *file = WorkspaceCurrentFile(EditorWorkspace(editor));
+                if(file != NULL && !SpellingSaveFileLanguage(file, language))
+                    SysBeep(1);
+                InvalidateFooter(window);
+            } else {
+                SysBeep(1);
+            }
+        }
+    }
+    if(choices != NULL)
+        CFRelease(choices);
+    if(languages != NULL)
+        CFRelease(languages);
+#else
+    if(item == 1 || item == 2) {
+        ClassicSpellingLanguage language = item == 2 ? kSpellingRussian : kSpellingEnglish;
+        changed = language != EditorSpellingLanguage(editor);
+        EditorSetSpellingLanguage(editor, language);
+        if(!WorkspaceRememberSpelling(editor))
+            SysBeep(1);
+        InvalidateFooter(window);
+    }
+#endif
+    return changed;
+}
+
 static unsigned OutlineRows(Rect bounds)
 {
     short height = bounds.bottom - bounds.top - kOutlineFirstRow - kOutlinePager;
@@ -1687,11 +2004,26 @@ static void ClickOutline(Editor *editor, Rect bounds, Point point)
     }
 }
 
+static Boolean NeedsPaint(const Rect *bounds, RgnHandle region)
+{
+    return region == NULL || RectInRgn(bounds, region);
+}
+
 static void DrawDocument(WindowRef window)
 {
     Editor *editor = GetDocument(window);
     SetPortWindowPort(window);
     BeginUpdate(window);
+#if TARGET_API_MAC_CARBON
+    if(gPaintRegion == NULL)
+        gPaintRegion = NewRgn();
+    RgnHandle region = gPaintRegion != NULL
+        ? GetPortVisibleRegion(GetWindowPort(window), gPaintRegion) : NULL;
+#else
+    GrafPtr port;
+    GetPort(&port);
+    RgnHandle region = port->visRgn;
+#endif
     Rect canvas = WindowCanvas(window);
     const EditorTheme *theme = &kThemes[gTheme - 1];
     if(editor != NULL)
@@ -1708,21 +2040,29 @@ static void DrawDocument(WindowRef window)
         EraseRect(&left);
         EraseRect(&right);
         EraseRect(&bottom);
-    } else
-        EraseRect(&canvas);
-    if(editor != NULL)
-        EditorDraw(editor);
-    if(editor != NULL) {
-        Str255 counter;
-        FooterCounter(editor, counter);
-        WorkspaceDraw(EditorWorkspace(editor), window, theme, counter,
-                      gSidebarVisible && !gFocusMode, !gFocusMode);
-        Rect outline = OutlineBounds(EditorBounds(window));
-        if(!EmptyRect(&outline) && EditorOutlineReady(editor))
+
+        if(NeedsPaint(&view, region))
+            EditorDraw(editor);
+        Rect sidebar = {0, 0, contentBottom, contentLeft};
+        Rect footer = {contentBottom, 0, canvas.bottom, canvas.right};
+        Boolean drawSidebar = contentLeft != 0 && NeedsPaint(&sidebar, region);
+        Boolean drawFooter = !gFocusMode && NeedsPaint(&footer, region);
+        if(drawSidebar || drawFooter) {
+            Str255 counter = {0}, language = {0};
+            if(drawFooter) {
+                FooterCounter(editor, counter);
+                FooterLanguage(editor, language);
+            }
+            WorkspaceDraw(EditorWorkspace(editor), window, theme, counter, language,
+                          drawSidebar, drawFooter);
+        }
+        Rect outline = OutlineBounds(view);
+        if(!EmptyRect(&outline) && NeedsPaint(&outline, region) && EditorOutlineReady(editor))
             DrawOutline(editor, outline, theme);
         RGBBackColor(&theme->page);
         RGBForeColor(&theme->divider);
-    }
+    } else
+        EraseRect(&canvas);
     if(editor != NULL) {
         short right = canvas.right, bottom = canvas.bottom;
 #if TARGET_API_MAC_CARBON
@@ -1739,13 +2079,14 @@ static void DrawDocument(WindowRef window)
     }
     if(editor != NULL)
         RGBForeColor(&theme->text);
-    if(editor != NULL && gQuickOpen.visible && gQuickOpen.window == window) {
-        Rect bounds = QuickOpenBounds(window);
+    Rect bounds = gQuickOpen.visible && gQuickOpen.window == window
+        ? QuickOpenBounds(window) : (Rect){0};
+    if(editor != NULL && !EmptyRect(&bounds) && NeedsPaint(&bounds, region)) {
         DrawPanel(bounds, theme);
         Rect field = {bounds.top + 4, bounds.left + kPanelInset,
                       bounds.top + kQuickFieldHeight - 4, bounds.right - kPanelInset};
-        DrawPanelField(field, gQuickOpen.query, "\pQuick Open",
-                       gQuickOpen.query[0], true, false, theme);
+        DrawPanelField(field, &gQuickOpen.query, "\pQuick Open",
+                       gQuickOpen.query.length, true, false, theme);
         for(unsigned i = 0; i < (gQuickOpen.count == 0 ? 1 : gQuickOpen.count); ++i) {
             Rect row = {bounds.top + kQuickFieldHeight + i * kQuickRowHeight,
                         bounds.left + 1,
@@ -1763,9 +2104,13 @@ static void DrawDocument(WindowRef window)
             static const Str63 prompt = "\pType a file name";
             static const Str63 noMatches = "\pNo matching files";
             ConstStr255Param name = gQuickOpen.count != 0 ? gQuickOpen.files[i].name :
-                gQuickOpen.query[0] == 0 ? prompt : noMatches;
+                gQuickOpen.query.length == 0 ? prompt : noMatches;
             Str255 label;
             memcpy(label, name, name[0] + 1);
+#if !TARGET_API_MAC_CARBON
+            short filenameFont = gQuickOpen.count != 0 ? gQuickOpen.filenameFonts[i] : 0;
+            TextFont(filenameFont > 0 ? filenameFont : 0);
+#endif
             TruncString(bounds.right - bounds.left - 18, label, smTruncMiddle);
             MoveTo(bounds.left + 9, row.top + 13);
             DrawString(label);
@@ -1774,8 +2119,11 @@ static void DrawDocument(WindowRef window)
         RGBForeColor(&theme->text);
         TextMode(srcOr);
     }
-    if(editor != NULL && gFind.window == window)
-        DrawFind(window, theme);
+    if(editor != NULL && gFind.window == window) {
+        Rect find = FindBounds(window);
+        if(NeedsPaint(&find, region))
+            DrawFind(window, theme);
+    }
     EndUpdate(window);
 #if TARGET_API_MAC_CARBON
     QDFlushPortBuffer(GetWindowPort(window), NULL);
@@ -1916,9 +2264,7 @@ static void HandleMouseDown(EventRecord *event)
                         break;
                     }
                     Boolean contextual = (event->modifiers & controlKey) != 0;
-#if TARGET_API_MAC_CARBON
                     contextual |= IsShowContextualMenuClick(event);
-#endif
                     if(gSidebarVisible && !gFocusMode &&
                        WorkspaceClick(editor, window, point, contextual, &file)) {
                         if(file.name[0] != 0)
@@ -1927,8 +2273,17 @@ static void HandleMouseDown(EventRecord *event)
                     }
                     Rect canvas = WindowCanvas(window);
                     if(!gFocusMode && point.v >= canvas.bottom - 23) {
-                        if(!contextual && gSettings.counter != kCounterHidden &&
-                           point.h >= canvas.right - 149 && point.h < canvas.right - 18) {
+                        Str255 counter, language;
+                        FooterCounter(editor, counter);
+                        FooterLanguage(editor, language);
+                        Rect picker = WorkspaceLanguageBounds(canvas, counter, language);
+                        if(!contextual && PtInRect(point, &picker)) {
+                            Point anchor = {picker.top, picker.left};
+                            LocalToGlobal(&anchor);
+                            ChooseSpellingLanguage(editor, window, anchor);
+                        } else if(!contextual && counter[0] != 0 &&
+                                  point.h >= (EmptyRect(&picker) ? canvas.right - 149 : picker.right) &&
+                                  point.h < canvas.right - 18) {
                             short next = gSettings.counter == kCounterWords
                                 ? kCounterCharacters : kCounterWords;
                             DoMenuCommand(((long)kViewMenu << 16) | (kFirstCounterItem + next));
@@ -1941,7 +2296,7 @@ static void HandleMouseDown(EventRecord *event)
                         break;
                     }
                     if(contextual) {
-                        if(EditorContextMenu(editor, point, gFindText))
+                        if(EditorContextMenu(editor, point, &gFindText))
                             ShowFind(window, false);
                         InvalidateFooter(window);
                     } else if(!TrackSelectedText(window, event)) {
@@ -2068,6 +2423,13 @@ static void PollWheelInput(void)
 static long CommandMenuSelection(const EventRecord *event)
 {
     unsigned char key = event->message & charCodeMask;
+    if(GetDocument(FrontWindow()) != NULL && (event->modifiers & (optionKey | controlKey)) == 0) {
+        if(key == ':')
+            return ((long)kSpellingMenu << 16) | kReviewSpelling;
+        if(key == ';')
+            return ((long)kSpellingMenu << 16) |
+                   ((event->modifiers & shiftKey) ? kReviewSpelling : kCheckSpelling);
+    }
     if((event->modifiers & (shiftKey | optionKey | controlKey)) == shiftKey &&
        GetDocument(FrontWindow()) != NULL) {
         switch(key) {
@@ -2102,12 +2464,14 @@ static void HandleKeyDown(EventRecord *event)
         } else if(input == 0x1f && gQuickOpen.selected + 1 < gQuickOpen.count) {
             ++gQuickOpen.selected;
             InvalidateWindow(window);
-        } else if(input == 8 && gQuickOpen.query[0] != 0) {
-            --gQuickOpen.query[0];
+        } else if(input == 8 && gQuickOpen.query.length != 0) {
+            gQuickOpen.query.length = FieldPrevious(&gQuickOpen.query, gQuickOpen.query.length);
             gQuickOpen.selected = 0;
             RefreshQuickOpen();
-        } else if(input >= 32 && input != 127 && gQuickOpen.query[0] < 63) {
-            gQuickOpen.query[++gQuickOpen.query[0]] = input;
+        } else if(input >= 32 && input != 127 && gQuickOpen.query.length < 63) {
+            UniChar ch;
+            if(EditorDecodeKey(input, &ch))
+                gQuickOpen.query.text[gQuickOpen.query.length++] = ch;
             gQuickOpen.selected = 0;
             RefreshQuickOpen();
         }
@@ -2138,9 +2502,91 @@ static void HandleKeyDown(EventRecord *event)
     if(editor != NULL) {
         SetPortWindowPort(window);
         EditorKey(editor, event);
-        InvalidateFooter(window);
     }
 }
+
+static Boolean InsertUnicodeInput(const UniChar *text, unsigned length, unsigned modifiers)
+{
+    WindowRef window = FrontWindow();
+    Editor *editor = GetDocument(window);
+    if(editor == NULL || length == 0 || (modifiers & (cmdKey | controlKey)))
+        return false;
+    for(unsigned i = 0; i < length; ++i) {
+        UniChar ch = text[i];
+        if(ch < ' ' || ch == 0x7f || (ch >= 0xf700 && ch <= 0xf747))
+            return false;
+        if((ch & 0xfc00) == 0xd800) {
+            if(++i == length || (text[i] & 0xfc00) != 0xdc00)
+                return false;
+        } else if((ch & 0xfc00) == 0xdc00) {
+            return false;
+        }
+    }
+    SetPortWindowPort(window);
+    if(gFind.window == window) {
+        EditFindText(gFind.replaceField ? &gReplaceText : &gFindText, text, length, 0);
+    } else if(gQuickOpen.visible && gQuickOpen.window == window) {
+        SearchField *field = &gQuickOpen.query;
+        if(length <= 63 - field->length) {
+            memcpy(field->text + field->length, text, length * sizeof(*text));
+            field->length += length;
+            gQuickOpen.selected = 0;
+            RefreshQuickOpen();
+        }
+    } else {
+        EditorInsertText(editor, text, length);
+    }
+    return true;
+}
+
+#if TARGET_API_MAC_CARBON
+static pascal OSStatus UnicodeInput(EventHandlerCallRef next, EventRef event, void *data)
+{
+    (void)next;
+    (void)data;
+    EventRef key;
+    UInt32 modifiers = 0, size;
+    if(GetEventParameter(event, kEventParamTextInputSendKeyboardEvent, typeEventRef,
+                         NULL, sizeof(key), NULL, &key) == noErr)
+        GetEventParameter(key, kEventParamKeyModifiers, typeUInt32, NULL, sizeof(modifiers), NULL, &modifiers);
+    if(GetEventParameter(event, kEventParamTextInputSendText, typeUnicodeText, NULL, 0, &size, NULL) != noErr ||
+       size == 0 || size % sizeof(UniChar) != 0 || size > 2 * kTextFileLimit)
+        return eventNotHandledErr;
+    UniChar *text = malloc(size);
+    if(text == NULL)
+        return memFullErr;
+    OSStatus error = GetEventParameter(event, kEventParamTextInputSendText, typeUnicodeText,
+                                       NULL, size, NULL, text);
+    Boolean inserted = error == noErr && InsertUnicodeInput(text, size / sizeof(*text), modifiers);
+    free(text);
+    return inserted ? noErr : eventNotHandledErr;
+}
+#else
+static pascal OSErr UnicodeInput(const AppleEvent *event, AppleEvent *reply, long refcon)
+{
+    (void)reply;
+    (void)refcon;
+    EventRecord key;
+    DescType type;
+    Size size;
+    Boolean hasKey = AEGetParamPtr(event, keyAETSMEventRecord, typeLowLevelEventRecord,
+                                   &type, &key, sizeof(key), &size) == noErr && size == sizeof(key);
+    AEDesc text;
+    if(AEGetParamDesc(event, keyAETheData, typeUnicodeText, &text) == noErr) {
+        size = GetHandleSize(text.dataHandle);
+        HLock(text.dataHandle);
+        Boolean inserted = size % sizeof(UniChar) == 0 &&
+            InsertUnicodeInput((const UniChar *)*text.dataHandle, size / sizeof(UniChar),
+                               hasKey ? key.modifiers : 0);
+        AEDisposeDesc(&text);
+        if(inserted)
+            return noErr;
+    }
+    if(hasKey)
+        HandleKeyDown(&key);
+    return noErr;
+}
+#endif
 
 static void DispatchEvent(EventRecord *event)
 {
@@ -2150,7 +2596,13 @@ static void DispatchEvent(EventRecord *event)
     switch(event->what) {
         case mouseDown: HandleMouseDown(event); break;
         case keyDown:
-        case autoKey: HandleKeyDown(event); break;
+        case autoKey:
+#if !TARGET_API_MAC_CARBON
+            if(gTextInput != NULL && !(event->modifiers & (cmdKey | controlKey)) && TSMEvent(event))
+                break;
+#endif
+            HandleKeyDown(event);
+            break;
         case updateEvt: DrawDocument((WindowRef)event->message); break;
         case activateEvt:
             window = (WindowRef)event->message;
@@ -2160,6 +2612,12 @@ static void DispatchEvent(EventRecord *event)
             if((event->message >> 24) == kSuspendResumeMessage) {
                 Boolean foreground = (event->message & kResumeFlag) != 0;
                 gForeground = foreground;
+                if(gTextInput != NULL) {
+                    if(foreground)
+                        ActivateTSMDocument(gTextInput);
+                    else
+                        DeactivateTSMDocument(gTextInput);
+                }
                 ActivateDocument(FrontWindow(), foreground);
             }
             break;
@@ -2405,7 +2863,7 @@ static const char *SmokeSelectionDrag(WindowRef window, Editor *editor)
         return "FAIL: load the selection drag fixture";
     }
     unsigned ordinal;
-    if(EditorSearch(editor, "\ptwo ", 1, &ordinal) != 1 || !EditorSelectionAt(editor, 4, 8))
+    if(EditorSearch(editor, &(SearchField){u"two ", 4}, 1, &ordinal) != 1 || !EditorSelectionAt(editor, 4, 8))
         return "FAIL: select the drag fixture";
     DrawDocument(window);
     Rect view = EditorBounds(window);
@@ -2803,7 +3261,7 @@ static const char *SmokeFind(Editor *editor, WindowRef window)
     EventRecord key = {.what = keyDown, .modifiers = cmdKey, .message = 'f'};
     DispatchEvent(&key);
     if(gFind.window != window || gFind.expanded ||
-       !EqualString(gFindText, "\pOne", true, true))
+       (gFindText.length != 3 || memcmp(gFindText.text, u"One", 3 * sizeof(UniChar)) != 0))
         return "FAIL: Command-F did not open the Find panel";
     Rect view = EditorBounds(window);
     Rect overlay = FindBounds(window);
@@ -2859,6 +3317,30 @@ static const char *SmokeFind(Editor *editor, WindowRef window)
     Rect restored = EditorBounds(window);
     if(gFind.window != NULL || !EqualRect(&original, &restored))
         return "FAIL: Escape did not restore the document view";
+    EditorCommand(editor, kSelectAllItem);
+    static const UniChar typed[] = u"École\r\u041f\u0440\u0438\u0432\u0435\u0442";
+    if(!InsertUnicodeInput(typed, 5, 0))
+        return "FAIL: insert accented Unicode text";
+    key.message = '\r';
+    DispatchEvent(&key);
+    if(!InsertUnicodeInput(typed + 6, 6, 0))
+        return "FAIL: insert Cyrillic Unicode text";
+    key.message = 0x1e;
+    key.modifiers = optionKey | shiftKey;
+    DispatchEvent(&key);
+    if(!EditorSelectionAt(editor, 12, 6))
+        return "FAIL: Option-Shift-Up did not select to the paragraph start";
+    ShowFind(window, false);
+    if(!InsertUnicodeInput(u"école", 5, 0) || gFind.count != 1 ||
+       !EditorSelectionAt(editor, 0, 5))
+        return "FAIL: Find did not match Unicode case";
+    ShowFind(window, true);
+    if(!InsertUnicodeInput(u"\u03a9", 1, 0))
+        return "FAIL: enter a Unicode replacement";
+    ReplaceFound(false);
+    CloseFind();
+    if(!SmokeSourceIs(editor, "\xce\xa9\n\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82"))
+        return "FAIL: Replace did not insert Unicode text";
     return NULL;
 }
 
@@ -2876,7 +3358,7 @@ static void SmokeQuickQuery(const char *query)
 static const char *SmokeQuickOpenPanel(WindowRef window)
 {
     SmokeQuickQuery("");
-    if(!gQuickOpen.visible || gQuickOpen.window != window || gQuickOpen.query[0] != 0)
+    if(!gQuickOpen.visible || gQuickOpen.window != window || gQuickOpen.query.length != 0)
         return "FAIL: Quick Open palette did not appear";
     DrawDocument(window);
     Rect bounds = QuickOpenBounds(window);
@@ -2886,11 +3368,11 @@ static const char *SmokeQuickOpenPanel(WindowRef window)
         return "FAIL: Quick Open prompt background was painted with the text color";
     EventRecord key = {.what = keyDown, .message = 'n'};
     DispatchEvent(&key);
-    if(!gQuickOpen.visible || gQuickOpen.query[0] != 1 || gQuickOpen.query[1] != 'n')
+    if(!gQuickOpen.visible || gQuickOpen.query.length != 1 || gQuickOpen.query.text[0] != 'n')
         return "FAIL: Quick Open palette did not accept a query";
     key.message = 8;
     DispatchEvent(&key);
-    if(gQuickOpen.query[0] != 0)
+    if(gQuickOpen.query.length != 0)
         return "FAIL: Quick Open palette did not erase its query";
     key.message = 0x1b;
     DispatchEvent(&key);
@@ -3043,9 +3525,28 @@ static const char *SmokeTest(WindowRef window)
     if(editor == NULL || FrontWindow() != window)
         return "FAIL: could not open the editor window";
 
-    if(CountMenuItems(GetMenu(kEditMenu)) != kTaskItem ||
+    if(CountMenuItems(GetMenuHandle(kEditMenu)) != kSpellingItem ||
        CountMenuItems(GetMenu(kFileMenu)) != kQuitItem)
         return "FAIL: the File or Edit menu did not load all commands";
+
+    MenuID spelling;
+    if(GetMenuItemHierarchicalID(GetMenuHandle(kEditMenu), kSpellingItem, &spelling) != noErr ||
+       spelling != kSpellingMenu || CountMenuItems(GetMenuHandle(spelling)) != kLiveSpelling)
+        return "FAIL: Edit menu did not load the Spelling submenu";
+
+#if !TARGET_API_MAC_CARBON
+    MenuRef languages = NewMenu(140, "\pSpelling Language");
+    if(languages == NULL)
+        return "FAIL: create the spelling language menu";
+    AppendClassicSpellingLanguages(languages);
+    Str255 english;
+    GetMenuItemText(languages, 1, english);
+    Boolean usable = ((**languages).enableFlags & 6) == 6 &&
+                     EqualString(english, "\pEnglish (US)", true, true);
+    DisposeMenu(languages);
+    if(!usable)
+        return "FAIL: both spelling languages must be selectable";
+#endif
 
 #if TARGET_API_MAC_CARBON
     WindowAttributes attributes;
@@ -3177,6 +3678,7 @@ int main(void)
     InitDialogs(NULL);
 #endif
     InitCursor();
+    InitContextualMenus();
 #ifdef LINEWREN_SMOKE_TEST
     SettingsDefaults(&gSettings);
 #else
@@ -3230,6 +3732,21 @@ int main(void)
     if(first == NULL)
         gRunning = false;
     else {
+#if TARGET_API_MAC_CARBON
+        EventTypeSpec textEvent = {kEventClassTextInput, kEventTextInputUnicodeForKeyEvent};
+        EventHandlerUPP input = NewEventHandlerUPP(UnicodeInput);
+        OSErr inputStatus = input != NULL
+            ? InstallApplicationEventHandler(input, 1, &textEvent, NULL, NULL) : memFullErr;
+#else
+        AEEventHandlerUPP input = NewAEEventHandlerUPP(UnicodeInput);
+        OSErr inputStatus = input != NULL
+            ? AEInstallEventHandler(kTextServiceClass, kUnicodeNotFromInputMethod, input, 0, false) : memFullErr;
+#endif
+        InterfaceTypeList interfaces = {kUnicodeDocument};
+        if(inputStatus == noErr && NewTSMDocument(1, interfaces, &gTextInput, 0) == noErr) {
+            UseInputWindow(gTextInput, true);
+            ActivateTSMDocument(gTextInput);
+        }
         RestoreDrafts(first);
         StartWheelInput();
     }
@@ -3262,6 +3779,8 @@ int main(void)
 #ifndef LINEWREN_SMOKE_TEST
     SaveSettings();
 #endif
+    if(gTextInput != NULL)
+        DeleteTSMDocument(gTextInput);
     while(FrontWindow() != NULL) {
         WindowRef window = FrontWindow();
 #if !TARGET_API_MAC_CARBON
@@ -3284,6 +3803,11 @@ int main(void)
         AERemoveEventHandler(kCoreEventClass, kAEQuitApplication, quitApplication, false);
         DisposeAEEventHandlerUPP(quitApplication);
     }
+    if(gPaintRegion != NULL)
+        DisposeRgn(gPaintRegion);
+#else
+    if(gTitleWDEF != NULL)
+        DisposeHandle(gTitleWDEF);
 #endif
 #ifdef LINEWREN_SMOKE_TEST
     if(editorReady)

@@ -2,10 +2,22 @@
 #define LINEWREN_EDITOR_H
 
 #include <Events.h>
+#if TARGET_API_MAC_CARBON
+#include <CFString.h>
+#else
+#include "classic-spelling.h"
+#endif
 #include <Windows.h>
 #include <stddef.h>
+#include "text-files.h"
 
 typedef struct Editor Editor;
+
+enum { kSearchFieldLimit = 255 };
+typedef struct {
+    UniChar text[kSearchFieldLimit];
+    unsigned length;
+} SearchField;
 
 enum { kEditorScrollbarWidth = 16 };
 
@@ -31,6 +43,19 @@ Boolean EditorInit(void);
 void EditorShutdown(void);
 Editor *EditorNew(WindowRef window, const Rect *view, OSStatus *status);
 void EditorDelete(Editor *editor);
+void EditorCheckSpelling(Editor *editor, WindowRef window);
+void EditorReviewSpelling(Editor *editor, WindowRef window,
+                          void (*languageLabel)(Editor *, Str255),
+                          Boolean (*chooseLanguage)(Editor *, WindowRef, Point));
+#if TARGET_API_MAC_CARBON
+CFStringRef EditorSpellingLanguage(const Editor *editor);
+CFStringRef EditorSpellingOverride(const Editor *editor);
+void EditorSetSpellingLanguage(Editor *editor, CFStringRef language);
+#else
+ClassicSpellingLanguage EditorSpellingLanguage(const Editor *editor);
+void EditorSetSpellingLanguage(Editor *editor, ClassicSpellingLanguage language);
+#endif
+void EditorSetLiveSpelling(Editor *editor, Boolean enabled);
 void EditorDraw(Editor *editor);
 void EditorResize(Editor *editor, const Rect *view, const Rect *outline);
 void EditorActivate(Editor *editor, Boolean active);
@@ -40,16 +65,20 @@ RgnHandle EditorTextDragRegion(Editor *editor, Point point);
 Handle EditorCopySelectedText(Editor *editor);
 Rect EditorTextDropCaret(Editor *editor, Point point, Boolean copy);
 Boolean EditorDropSelection(Editor *editor, Point point, Boolean copy);
-Boolean EditorContextMenu(Editor *editor, Point point, Str255 find);
-Boolean EditorFindSelection(const Editor *editor, Str255 query);
+Boolean EditorContextMenu(Editor *editor, Point point, SearchField *find);
+Boolean EditorFindSelection(const Editor *editor, SearchField *query);
+void EditorInsertText(Editor *editor, const UniChar *text, unsigned length);
+Boolean EditorDecodeKey(unsigned char key, UniChar *character);
+unsigned EditorDecodeRoman(const char *input, unsigned length, UniChar *text);
+int EditorUnicodeEqual(const UniChar *left, const UniChar *right, size_t length);
 void EditorKey(Editor *editor, const EventRecord *event);
 void EditorIdle(Editor *editor);
 Boolean EditorCanUndo(Editor *editor);
 Boolean EditorCanRedo(Editor *editor);
 void EditorCommand(Editor *editor, short item);
-unsigned EditorSearch(Editor *editor, ConstStr255Param text, short direction, unsigned *ordinal);
-unsigned EditorReplaceText(Editor *editor, ConstStr255Param find,
-                           ConstStr255Param replacement, Boolean all);
+unsigned EditorSearch(Editor *editor, const SearchField *text, short direction, unsigned *ordinal);
+unsigned EditorReplaceText(Editor *editor, const SearchField *find,
+                           const SearchField *replacement, Boolean all);
 
 typedef struct {
     RGBColor page;
@@ -88,6 +117,7 @@ Boolean EditorSetTypography(Editor *editor, EditorTypography typography);
 OSStatus EditorTakeText(Editor *editor, Handle text);
 OSStatus EditorTakeDocument(Editor *editor, Handle text, Boolean markdown);
 OSStatus EditorEncodeText(Editor *editor, Handle *bytes);
+OSStatus EditorEncodeFile(Editor *editor, TextFileFormat format, Handle *bytes);
 
 #ifdef LINEWREN_SMOKE_TEST
 Boolean EditorAllSelected(Editor *editor);

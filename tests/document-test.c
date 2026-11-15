@@ -1,4 +1,5 @@
 #include "document.h"
+#include "classic-spelling.h"
 #include "markdown.h"
 
 #include <assert.h>
@@ -46,7 +47,7 @@ static void CheckDocumentSearch(void)
 {
     static const uint16_t text[] = u"aAaA\rAa";
     static const uint16_t needle[] = u"Aa";
-    DocumentQuery query = {text, needle, 7, 2};
+    DocumentQuery query = {text, needle, 7, 2, NULL};
     DocumentMatch match = DocumentFind(query, 0, 0);
     assert(match.count == 3 && match.ordinal == 1 && match.offset == 0);
     match = DocumentFind(query, 1, 0);
@@ -64,7 +65,7 @@ static void CheckDocumentSearch(void)
     query.queryLength = 0;
     match = DocumentFind(query, 0, 0);
     assert(match.count == 0 && match.ordinal == 0 && match.offset == query.length);
-    query = (DocumentQuery){u"Éé", u"é", 2, 1};
+    query = (DocumentQuery){u"Éé", u"é", 2, 1, NULL};
     assert(DocumentNextMatch(query, 0) == 1);
 }
 
@@ -85,11 +86,53 @@ static void CheckOutline(void)
     free(styles);
 }
 
+static void CheckSpellingText(void)
+{
+    static const uint16_t note[] =
+        u"# Café **draft**\r[Read](https://example.org) and \x60ignored\x60.\r"
+        u"https://example.org <https://example.org>\r\r"
+        u"\x60\x60\x60lang\rignored\r\x60\x60\x60\r";
+    static const uint16_t expected[] =
+        u"  Café   draft  \r Read                       and          .\r"
+        u"                                         \r\r"
+        u"       \r       \r   \r";
+    uint16_t prose[sizeof(note) / sizeof(*note) - 1];
+    assert(MarkdownSpellingText(note, sizeof(prose) / sizeof(*prose), prose));
+    assert(sizeof(note) == sizeof(expected));
+    assert(memcmp(prose, expected, sizeof(prose)) == 0);
+}
+
+static void CheckClassicSpellingWords(void)
+{
+    static const uint16_t text[] = u"‘Don’t’ café abc123 a_b русский alpha—beta 2026";
+    static const char *words[] = {"Don't", "caf\xe9", "alpha", "beta"};
+    static const unsigned starts[] = {1, 8, 32, 38};
+    unsigned offset = 0, start;
+    char word[kSpellingWordSize];
+    for(unsigned i = 0; i < sizeof(words) / sizeof(*words); ++i) {
+        assert(ClassicSpellingWord(kSpellingEnglish, text, sizeof(text) / sizeof(*text) - 1,
+                                   &offset, &start, word));
+        assert(strcmp(word, words[i]) == 0);
+        assert(start == starts[i] && offset == start + strlen(word));
+    }
+    assert(!ClassicSpellingWord(kSpellingEnglish, text, sizeof(text) / sizeof(*text) - 1,
+                                &offset, &start, word));
+    static const uint16_t russian[] = u"test Ёж—работал";
+    offset = 0;
+    assert(ClassicSpellingWord(kSpellingRussian, russian, 15, &offset, &start, word));
+    assert(start == 5 && offset == 7 && strcmp(word, "\xb3\xd6") == 0);
+    assert(ClassicSpellingDecode(kSpellingRussian, (unsigned char)word[0]) == russian[start]);
+    assert(ClassicSpellingWord(kSpellingRussian, russian, 15, &offset, &start, word));
+    assert(start == 8 && offset == 15 && strcmp(word, "\xd2\xc1\xc2\xcf\xd4\xc1\xcc") == 0);
+}
+
 int main(void)
 {
     CheckMarkdownActions();
     CheckDocumentSearch();
     CheckOutline();
+    CheckSpellingText();
+    CheckClassicSpellingWords();
     assert(Kind("note.md", 0) == kDocumentMarkdown);
     assert(Kind("NOTE.MARKDOWN", 0) == kDocumentMarkdown);
     assert(Kind("draft.mdown", 0) == kDocumentMarkdown);

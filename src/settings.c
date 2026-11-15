@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum { kSettingsMagic = 'LnwP', kSettingsVersion = 3 };
-enum { kSidebarFlag = 1, kTypewriterFlag = 2, kCounterShift = 2, kOutlineFlag = 16 };
+enum { kSidebarFlag = 1, kTypewriterFlag = 2, kCounterShift = 2, kOutlineFlag = 16, kLiveSpellingFlag = 32 };
 
 typedef struct {
     unsigned long magic;
@@ -156,6 +156,7 @@ static OSErr LoadSettingsFile(const FSSpec *file, AppSettings *settings)
         if(header.version >= 2) {
             settings->typewriter = (header.viewFlags & kTypewriterFlag) != 0;
             settings->outlineVisible = (header.viewFlags & kOutlineFlag) != 0;
+            settings->liveSpelling = (header.viewFlags & kLiveSpellingFlag) != 0;
             unsigned counter = (header.viewFlags >> kCounterShift) & 3;
             if(counter <= kCounterHidden)
                 settings->counter = counter;
@@ -195,6 +196,7 @@ static OSErr SaveSettingsFile(const FSSpec *file, const AppSettings *settings)
     unsigned char viewFlags = (settings->sidebarVisible ? kSidebarFlag : 0) |
                               (settings->typewriter ? kTypewriterFlag : 0) |
                               (settings->outlineVisible ? kOutlineFlag : 0) |
+                              (settings->liveSpelling ? kLiveSpellingFlag : 0) |
                               (settings->counter << kCounterShift);
     SettingsHeader header = {
         kSettingsMagic, kSettingsVersion, settings->theme, settings->points,

@@ -13,8 +13,15 @@ Workspace *WorkspaceNew(void);
 void WorkspaceDelete(Workspace *workspace);
 Workspace *EditorWorkspace(Editor *editor);
 short WorkspaceLabelFont(void);
+#if !TARGET_API_MAC_CARBON
+short WorkspaceCyrillicFont(void);
+short WorkspaceFilenameFont(const FSSpec *file);
+short WorkspaceTitleFont(const Workspace *workspace);
+#endif
 void WorkspaceDraw(Workspace *workspace, WindowRef window, const EditorTheme *theme,
-                   ConstStr255Param counter, Boolean sidebarVisible, Boolean footerVisible);
+                   ConstStr255Param counter, ConstStr255Param language,
+                   Boolean sidebarVisible, Boolean footerVisible);
+Rect WorkspaceLanguageBounds(Rect canvas, ConstStr255Param counter, ConstStr255Param language);
 void WorkspaceRefreshSidebar(Workspace *workspace, WindowRef window);
 Boolean WorkspaceClick(Editor *editor, WindowRef window, Point point, Boolean contextual,
                        FSSpec *openFile);
@@ -25,12 +32,17 @@ OSErr WorkspaceAttachFolder(Workspace *workspace, WindowRef window, short volume
 void WorkspaceRestoreFolders(Workspace *workspace, WindowRef window,
                              const FSSpec *folders, unsigned count);
 unsigned WorkspaceCopyFolders(Workspace *workspace, FSSpec *folders, unsigned capacity);
-unsigned WorkspaceSearch(Workspace *workspace, ConstStr255Param query,
+unsigned WorkspaceSearch(Workspace *workspace, const SearchField *query,
                          FSSpec *files, unsigned capacity);
 OSErr WorkspaceOpen(Editor *editor, WindowRef window, const FSSpec *file);
+OSErr WorkspaceOpenMacRoman(Editor *editor, WindowRef window, const FSSpec *file);
+void WorkspaceReload(Editor *editor, WindowRef window);
 void WorkspaceOpenError(Workspace *workspace, WindowRef window, OSErr error);
 Boolean WorkspaceHasFile(Workspace *workspace, const FSSpec *file);
 const FSSpec *WorkspaceCurrentFile(const Workspace *workspace);
+#if !TARGET_API_MAC_CARBON
+Boolean WorkspaceRememberSpelling(Editor *editor);
+#endif
 void WorkspaceEdited(Workspace *workspace);
 void WorkspaceIdle(Editor *editor, WindowRef window);
 Boolean WorkspaceNextRecovery(short *index, FSSpec *file);

@@ -44,4 +44,7 @@ bool MarkdownToggleTask(const uint16_t *text, const uint16_t *styles, unsigned l
 unsigned MarkdownLinkAt(const uint16_t *text, unsigned length, unsigned at,
                         uint16_t *url, unsigned capacity);
 
+/* Replace non-prose with spaces, keeping the original UTF-16 offsets. */
+bool MarkdownSpellingText(const uint16_t *text, unsigned length, uint16_t *prose);
+
 #endif

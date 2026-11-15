@@ -1,0 +1,14 @@
+MySpell 3.0+pre3.1 from Debian's original source archive.
+https://deb.debian.org/debian/pool/main/m/myspell/myspell_3.0+pre3.1.orig.tar.gz
+SHA-256 33492659e280a2a0a7036e3f465ddb557778a8d33997c7bb121fd3c3a49eeb30
+
+Modified for Linewren. The engine reads caller-owned streams and reports
+dictionary load failure. The hash uses an unsigned 32-bit rotation.
+See license.readme and CONTRIBUTORS.
+
+The US English dictionary comes from ESDB release 2026.02.25.
+https://github.com/en-wl/wordlist/releases/tag/rel-2026.02.25
+See README_en_US.txt for dictionary notices. The pilot dictionary is a
+modified ISO-8859-1 export. It omits unsupported Hunspell directives and
+entries flagged ONLYINCOMPOUND or NOSUGGEST, and drops entries that cannot
+be encoded in ISO-8859-1. The header reflects the resulting entry count.

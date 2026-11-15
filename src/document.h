@@ -15,10 +15,11 @@ DocumentKind DocumentKindForName(const unsigned char *name, size_t length, uint3
 int DocumentNameMatches(const unsigned char *name, size_t length,
                         const unsigned char *query, size_t queryLength);
 
-/* Case-insensitive for ASCII; exact for other UTF-16 units. */
+/* The optional comparator handles candidates containing non-ASCII differences. */
 typedef struct {
     const uint16_t *text, *query;
     size_t length, queryLength;
+    int (*unicodeEqual)(const uint16_t *, const uint16_t *, size_t);
 } DocumentQuery;
 
 typedef struct {

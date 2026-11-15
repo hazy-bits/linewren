@@ -51,6 +51,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
         math(EXPR icon_id "${icon_id} + 1")
     endforeach()
     list(APPEND linewren_resources "${icon_resources}")
+else()
+    enable_language(CXX)
+    set(spelling_resources "${CMAKE_CURRENT_BINARY_DIR}/classic-spelling.r")
+    file(WRITE "${spelling_resources}" "")
+    set(spelling_id 128)
+    foreach(stem vendor/myspell/en_US-pilot vendor/dictionaries/ru_RU/ru_RU)
+        foreach(extension aff dic)
+            set(dictionary "${CMAKE_CURRENT_SOURCE_DIR}/${stem}.${extension}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${dictionary}")
+            file(READ "${dictionary}" dictionary_hex HEX)
+            file(APPEND "${spelling_resources}" "data 'Spel' (${spelling_id}) { $\"${dictionary_hex}\" };\n")
+            math(EXPR spelling_id "${spelling_id} + 1")
+        endforeach()
+    endforeach()
+    list(APPEND linewren_resources "${spelling_resources}")
 endif()
 add_application(Linewren
     src/main.c
@@ -63,11 +78,17 @@ target_compile_definitions(Linewren PRIVATE MD4C_USE_UTF16 LINEWREN_VERSION="${l
 target_compile_features(Linewren PRIVATE c_std_11)
 target_include_directories(Linewren PRIVATE vendor/md4c)
 if(CMAKE_SYSTEM_NAME STREQUAL "RetroCarbon")
-    target_sources(Linewren PRIVATE src/carbon-alloc.c)
+    target_sources(Linewren PRIVATE src/carbon-alloc.c src/spelling.c)
     target_compile_definitions(Linewren PRIVATE realloc=LinewrenCarbonRealloc)
 else()
+    target_sources(Linewren PRIVATE src/classic-spelling.c src/classic-spelling-engine.cpp
+        vendor/myspell/affentry.cxx vendor/myspell/affixmgr.cxx vendor/myspell/csutil.cxx
+        vendor/myspell/hashmgr.cxx vendor/myspell/myspell.cxx vendor/myspell/suggestmgr.cxx)
+    target_include_directories(Linewren PRIVATE vendor/myspell)
+    target_compile_options(Linewren PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti>)
     target_link_libraries(Linewren PRIVATE AppearanceLib NavigationLib InputSprocketLib ATSUnicodeLib
-                                        UnicodeConverter FontManager InternetConfigLib DragLib)
+                                        UnicodeConverter TextCommon UnicodeUtilitiesLib FontManager InternetConfigLib DragLib
+                                        ContextualMenu)
 endif()
 
 set_target_properties(Linewren PROPERTIES COMPILE_OPTIONS -ffunction-sections)

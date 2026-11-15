@@ -15,6 +15,8 @@ typedef struct {
     MarkdownHeading *headings;
     unsigned headingCount, headingCapacity;
     bool collectHeadings, headingListed;
+    uint16_t *prose;
+    bool autolink;
 } Styling;
 
 static void MarkSource(MD_SOURCE_TYPE kind, MD_OFFSET start, MD_OFFSET end,
@@ -72,8 +74,11 @@ static void ChangeSpan(MD_SPANTYPE kind, Styling *state, int delta)
 static int EnterSpan(MD_SPANTYPE kind, void *detail, void *data)
 {
     Styling *state = data;
-    if(kind == MD_SPAN_A)
-        state->href = ((MD_SPAN_A_DETAIL *)detail)->href;
+    if(kind == MD_SPAN_A) {
+        const MD_SPAN_A_DETAIL *link = detail;
+        state->href = link->href;
+        state->autolink = link->is_autolink != 0;
+    }
     ChangeSpan(kind, state, 1);
     return 0;
 }
@@ -82,8 +87,10 @@ static int LeaveSpan(MD_SPANTYPE kind, void *detail, void *data)
 {
     (void)detail;
     Styling *state = data;
-    if(kind == MD_SPAN_A)
+    if(kind == MD_SPAN_A) {
         state->href = (MD_ATTRIBUTE){0};
+        state->autolink = false;
+    }
     ChangeSpan(kind, state, -1);
     return 0;
 }
@@ -120,6 +127,11 @@ static int StyleText(MD_TEXTTYPE kind, const MD_CHAR *text, MD_SIZE length, void
     unsigned start = (address - source) / sizeof(*text);
     if(length > state->length - start)
         return 0;
+    if(state->prose != NULL) {
+        if(kind == MD_TEXT_NORMAL && !state->autolink)
+            memcpy(state->prose + start, text, length * sizeof(*text));
+        return 0;
+    }
     if(state->styles == NULL) {
         if(state->click >= start && state->click - start < length &&
            state->href.size != 0 && state->href.size <= state->capacity) {
@@ -190,6 +202,14 @@ unsigned MarkdownLinkAt(const uint16_t *text, unsigned length, unsigned at,
     Styling state = {.text = text, .length = length, .click = at,
                      .url = url, .capacity = capacity};
     return ParseMarkdown(&state) == 0 ? state.urlLength : 0;
+}
+
+bool MarkdownSpellingText(const uint16_t *text, unsigned length, uint16_t *prose)
+{
+    for(unsigned i = 0; i < length; ++i)
+        prose[i] = text[i] == '\r' || text[i] == '\n' ? text[i] : ' ';
+    Styling state = {.text = text, .length = length, .prose = prose};
+    return ParseMarkdown(&state) == 0;
 }
 
 typedef struct {

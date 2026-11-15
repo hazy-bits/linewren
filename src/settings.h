@@ -14,6 +14,7 @@ typedef struct {
     Boolean sidebarVisible;
     Boolean typewriter;
     Boolean outlineVisible;
+    Boolean liveSpelling;
     unsigned char counter;
     Rect window;
     Str63 font;

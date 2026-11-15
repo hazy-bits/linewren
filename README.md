@@ -77,3 +77,9 @@ Linewren is available under the [MIT License](LICENSE).
 [MD4C](vendor/md4c/LICENSE.md) and the
 [Classic Mac App Template](https://github.com/hazy-bits/classic-mac-app-template/blob/main/LICENSE)
 use the MIT License.
+
+The Mac OS 9 spell checker uses a modified version of MySpell with
+US English and Russian dictionaries.
+[MySpell license](vendor/myspell/license.readme) ·
+[English dictionary notice](vendor/myspell/README_en_US.txt) ·
+[Russian dictionary sources and notices](vendor/dictionaries/ru_RU/README.txt)
