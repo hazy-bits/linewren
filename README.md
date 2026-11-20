@@ -24,9 +24,10 @@ has been used on PowerPC Tiger. Leopard validation is pending.
 - Use **⌘P** to find a file by name and **⌘F** to find or replace text in the
   current file. Select a word before opening Find to use it as the query.
 - Toggle the sidebar with **⌘1** and the clickable heading outline with **⌘2**.
-  Focus mode hides both and leaves the writing surface.
+  Focus Layout hides both and leaves the writing surface.
 - Choose light or dark mode, change the typeface and size, or turn on typewriter
-  scrolling. Click the footer count to switch between words and characters.
+  scrolling. Independent line and paragraph focus modes dim the surrounding
+  text. Click the footer count to switch between words and characters.
 - Format Markdown from the Edit menu. Linewren groups undo, saves edited files
   safely, and recovers surviving drafts separately after an interrupted session.
 - Control-click a sidebar item to rename it, reveal it in Finder, or move it to

@@ -20,6 +20,7 @@ typedef struct {
 } SearchField;
 
 enum { kEditorScrollbarWidth = 16 };
+enum { kEditorFocusNone, kEditorFocusLine, kEditorFocusParagraph };
 
 /* These values match the Edit menu resource. */
 enum {
@@ -96,6 +97,7 @@ void EditorSetMarkdown(Editor *editor, Boolean markdown);
 size_t EditorWordCount(Editor *editor);
 size_t EditorCharacterCount(Editor *editor);
 void EditorSetTypewriter(Editor *editor, Boolean enabled);
+void EditorSetFocusMode(Editor *editor, unsigned mode);
 unsigned EditorOutlineCount(const Editor *editor);
 Boolean EditorOutlineReady(const Editor *editor);
 unsigned EditorOutlinePage(Editor *editor, unsigned rows, short direction);

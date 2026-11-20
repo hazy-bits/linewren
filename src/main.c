@@ -23,6 +23,7 @@
 #include <Drag.h>
 #include <Events.h>
 #include <Fonts.h>
+#include <Icons.h>
 #include <Memory.h>
 #include <Menus.h>
 #include <OSUtils.h>
@@ -124,8 +125,9 @@ static struct {
 } gTextDrag;
 
 enum {
-    kLightTheme = 1, kDarkTheme = 2, kSidebarItem = 4, kFocusItem = 5,
-    kTypewriterItem = 6, kFirstCounterItem = 8, kOutlineItem = 12
+    kLightTheme = 1, kDarkTheme = 2, kSidebarItem = 4, kOutlineItem = 5,
+    kFocusItem = 6, kLineFocusItem = 8, kParagraphFocusItem = 9,
+    kTypewriterItem = 11, kFirstCounterItem = 13
 };
 static Boolean gSidebarVisible = true;
 static Boolean gFocusMode;
@@ -159,6 +161,8 @@ static void UpdateThemeMenu(void)
     CheckMenuItem(menu, kSidebarItem, gSidebarVisible);
     CheckMenuItem(menu, kFocusItem, gFocusMode);
     CheckMenuItem(menu, kTypewriterItem, gSettings.typewriter);
+    CheckMenuItem(menu, kLineFocusItem, gSettings.focusMode == kEditorFocusLine);
+    CheckMenuItem(menu, kParagraphFocusItem, gSettings.focusMode == kEditorFocusParagraph);
     CheckMenuItem(menu, kOutlineItem, gSettings.outlineVisible);
     for(short i = kCounterWords; i <= kCounterHidden; ++i)
         CheckMenuItem(menu, kFirstCounterItem + i, gSettings.counter == i);
@@ -502,6 +506,7 @@ static WindowRef NewDocument(OSStatus *outStatus)
                             gSettings.roots, gSettings.rootCount);
     EditorSetTypography(editor, gTypography);
     EditorSetTypewriter(editor, gSettings.typewriter);
+    EditorSetFocusMode(editor, gSettings.focusMode);
     EditorSetLiveSpelling(editor, gSettings.liveSpelling);
     Rect outline = OutlineBounds(view);
     if(!EmptyRect(&outline))
@@ -1071,6 +1076,20 @@ static void OpenQuickSelection(void)
     OpenDocument(window, &file);
 }
 
+#if !TARGET_API_MAC_CARBON
+static IconSuiteRef gAboutIcons;
+
+static pascal void DrawAboutIcon(DialogRef dialog, DialogItemIndex item)
+{
+    short type;
+    Handle handle;
+    Rect bounds;
+    GetDialogItem(dialog, item, &type, &handle, &bounds);
+    if(gAboutIcons != NULL)
+        PlotIconSuite(&bounds, kAlignAbsoluteCenter, kTransformNone, gAboutIcons);
+}
+#endif
+
 static void ShowAboutBox(void)
 {
 #if TARGET_API_MAC_CARBON
@@ -1082,32 +1101,37 @@ static void ShowAboutBox(void)
                   "\pA quiet place to write.\r\rMarkdown and plain text for PowerPC Mac OS X.",
                   NULL, &button);
 #else
-    WindowRef window = GetNewWindow(128, NULL, (WindowPtr)-1);
-    Handle text;
-    Rect bounds;
-    EventRecord event;
-
-    if(window == NULL)
+    DialogRef dialog = GetNewDialog(128, NULL, (WindowPtr)-1);
+    if(dialog == NULL)
         return;
-
-    MoveWindow(window,
-               MainScreenBounds().right / 2 - WindowCanvas(window).right / 2,
-               MainScreenBounds().bottom / 2 - WindowCanvas(window).bottom / 2,
-               false);
-    ShowWindow(window);
-    SetPortWindowPort(window);
-    text = GetResource('TEXT', 128);
-    if(text != NULL) {
-        HLock(text);
-        bounds = WindowCanvas(window);
-        InsetRect(&bounds, 14, 14);
-        TETextBox(*text, GetHandleSize(text), &bounds, teJustLeft);
-        HUnlock(text);
-    }
-
-    while(!WaitNextEvent(mDownMask | keyDownMask, &event, 6, NULL))
-        ;
-    DisposeWindow(window);
+    SetPortDialogPort(dialog);
+    short type;
+    Handle item;
+    Rect bounds;
+    GetDialogItem(dialog, 3, &type, &item, &bounds);
+    Str255 title;
+    title[0] = snprintf((char *)title + 1, sizeof(title) - 1,
+                        "Linewren %s", LINEWREN_VERSION);
+    SetDialogItemText(item, title);
+    GetDialogItem(dialog, 2, &type, &item, &bounds);
+    UserItemUPP drawIcon = NewUserItemUPP(DrawAboutIcon);
+    gAboutIcons = NULL;
+    GetIconSuite(&gAboutIcons, 128, svAllAvailableData);
+    if(drawIcon != NULL)
+        SetDialogItem(dialog, 2, type, (Handle)drawIcon, &bounds);
+    SetDialogDefaultItem(dialog, 1);
+    SetDialogCancelItem(dialog, 1);
+    ShowWindow(GetDialogWindow(dialog));
+    DrawDialog(dialog);
+    short selected = 0;
+    while(selected != 1)
+        ModalDialog(NULL, &selected);
+    if(gAboutIcons != NULL)
+        DisposeIconSuite(gAboutIcons, true);
+    gAboutIcons = NULL;
+    if(drawIcon != NULL)
+        DisposeUserItemUPP(drawIcon);
+    DisposeDialog(dialog);
 #endif
 }
 
@@ -1767,6 +1791,21 @@ static void DoMenuCommand(long command)
             if(editor != NULL) {
                 SetPortWindowPort(window);
                 EditorSetTypewriter(editor, gSettings.typewriter);
+            }
+        }
+        SetPort(port);
+        UpdateThemeMenu();
+    } else if(menu == kViewMenu &&
+              (item == kLineFocusItem || item == kParagraphFocusItem)) {
+        unsigned selected = item == kLineFocusItem ? kEditorFocusLine : kEditorFocusParagraph;
+        gSettings.focusMode = gSettings.focusMode == selected ? kEditorFocusNone : selected;
+        GrafPtr port;
+        GetPort(&port);
+        for(window = FrontWindow(); window != NULL; window = GetNextWindow(window)) {
+            Editor *editor = GetDocument(window);
+            if(editor != NULL) {
+                SetPortWindowPort(window);
+                EditorSetFocusMode(editor, gSettings.focusMode);
             }
         }
         SetPort(port);
@@ -3034,6 +3073,17 @@ static const char *SmokeViewModes(Editor *editor, WindowRef window)
     if(gFocusMode || !gSidebarVisible || !EqualRect(&initial, &restored) ||
        editor != GetDocument(window))
         return "FAIL: leaving Focus did not restore the original layout";
+    if(gSettings.typewriter)
+        DoMenuCommand(((long)kViewMenu << 16) | kTypewriterItem);
+    DoMenuCommand(((long)kViewMenu << 16) | kLineFocusItem);
+    if(gSettings.typewriter || gSettings.focusMode != kEditorFocusLine)
+        return "FAIL: Line Focus was coupled to Typewriter Scrolling";
+    DoMenuCommand(((long)kViewMenu << 16) | kParagraphFocusItem);
+    if(gSettings.typewriter || gSettings.focusMode != kEditorFocusParagraph)
+        return "FAIL: Paragraph Focus was not exclusive and independent";
+    DoMenuCommand(((long)kViewMenu << 16) | kParagraphFocusItem);
+    if(gSettings.focusMode != kEditorFocusNone)
+        return "FAIL: the active focus mode could not be disabled";
     Str255 label;
     DoMenuCommand(((long)kViewMenu << 16) | (kFirstCounterItem + kCounterCharacters));
     FooterCounter(editor, label);

@@ -88,14 +88,17 @@ resource 'MENU' (131) {
         "Dark", noIcon, noKey, noMark, plain;
         "-", noIcon, noKey, noMark, plain;
         "Sidebar", noIcon, "1", noMark, plain;
-        "Focus", noIcon, noKey, noMark, plain;
+        "Outline", noIcon, "2", noMark, plain;
+        "Focus Layout", noIcon, noKey, noMark, plain;
+        "-", noIcon, noKey, noMark, plain;
+        "Line Focus", noIcon, noKey, noMark, plain;
+        "Paragraph Focus", noIcon, noKey, noMark, plain;
+        "-", noIcon, noKey, noMark, plain;
         "Typewriter Scrolling", noIcon, noKey, noMark, plain;
         "-", noIcon, noKey, noMark, plain;
         "Show Word Count", noIcon, noKey, noMark, plain;
         "Show Character Count", noIcon, noKey, noMark, plain;
         "Hide Count", noIcon, noKey, noMark, plain;
-        "-", noIcon, noKey, noMark, plain;
-        "Outline", noIcon, "2", noMark, plain;
     }
 };
 
@@ -141,12 +144,21 @@ resource 'MENU' (137) {
     }
 };
 
-resource 'WIND' (128) {
-    {0, 0, 190, 340}, altDBoxProc;
-    invisible;
-    noGoAway;
-    0, "";
-    noAutoCenter;
+resource 'DLOG' (128) {
+    {90, 90, 272, 460}, movableDBoxProc;
+    invisible, noGoAway, 0, 128, "About Linewren";
+    centerMainScreen;
+};
+
+resource 'DITL' (128) {
+    {
+        {142, 272, 163, 352}, Button { enabled, "OK" };
+        {22, 20, 54, 52}, UserItem { disabled };
+        {18, 68, 38, 350}, StaticText { disabled, "Linewren" };
+        {48, 68, 68, 350}, StaticText { disabled, "A quiet place to write." };
+        {78, 68, 126, 350}, StaticText { disabled,
+            "Markdown and plain text for PowerPC and classic Macintosh computers." };
+    }
 };
 
 resource 'ALRT' (129) {

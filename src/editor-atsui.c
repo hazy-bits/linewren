@@ -88,6 +88,8 @@ struct Editor {
     uint16_t *styles;
     unsigned anchor, caret;
     Boolean trailing, active, markdown, stylePending, typewriter, trackingSelection;
+    unsigned char focusMode;
+    Boolean caretOnlyPending, moreBelow;
     unsigned long styleAt;
     unsigned long clickAt;
     Point clickPoint;
@@ -96,6 +98,7 @@ struct Editor {
     Boolean typing;
     unsigned long typedAt;
     ATSUStyle runs[kMarkdownDisplayMask + 1];
+    ATSUStyle dimRuns[kMarkdownDisplayMask + 1];
     const EditorTheme *theme;
     EditorTypography typography;
     ATSUFontID font;
@@ -197,6 +200,10 @@ static void DropStyles(Editor *editor)
         if(editor->runs[i] != NULL) {
             ATSUDisposeStyle(editor->runs[i]);
             editor->runs[i] = NULL;
+        }
+        if(editor->dimRuns[i] != NULL) {
+            ATSUDisposeStyle(editor->dimRuns[i]);
+            editor->dimRuns[i] = NULL;
         }
     }
 }
@@ -379,6 +386,7 @@ Workspace *EditorWorkspace(Editor *editor) { return editor->workspace; }
 
 void EditorSetTheme(Editor *editor, const EditorTheme *theme)
 {
+    editor->caretOnlyPending = false;
     DropStyles(editor);
     editor->theme = theme;
     editor->layoutError = noErr;
@@ -479,6 +487,7 @@ OSStatus EditorTakeDocument(Editor *editor, Handle text, Boolean markdown)
     editor->lastPageKnown = false;
     ResetSplits(editor);
     editor->layoutError = noErr;
+    editor->caretOnlyPending = false;
     InvalidateRect(&editor->view);
     return noErr;
 }
@@ -519,15 +528,22 @@ size_t EditorCharacterCount(Editor *editor)
 
 Boolean EditorIsMarkdown(Editor *editor) { return editor->markdown; }
 
-static OSStatus GetStyle(Editor *editor, unsigned flags, ATSUStyle *out)
+static OSStatus GetStyle(Editor *editor, unsigned flags, Boolean dimmed, ATSUStyle *out)
 {
-    ATSUStyle *style = &editor->runs[flags];
+    ATSUStyle *style = dimmed ? &editor->dimRuns[flags] : &editor->runs[flags];
     if(*style == NULL) {
         OSStatus status = ATSUCreateStyle(style);
         if(status != noErr)
             return status;
 
         MarkdownPresentation display = MarkdownDisplay(flags, editor->theme, editor->typography.points);
+        if(dimmed) {
+            display.color = (RGBColor){
+                (3u * display.color.red + 2u * editor->theme->page.red) / 5,
+                (3u * display.color.green + 2u * editor->theme->page.green) / 5,
+                (3u * display.color.blue + 2u * editor->theme->page.blue) / 5
+            };
+        }
         Fixed size = (Fixed)display.points << 16;
         Boolean isBold = (display.face & bold) != 0;
         Boolean isItalic = (display.face & italic) != 0;
@@ -558,7 +574,7 @@ static OSStatus MakeLayout(Editor *editor, LayoutSpan *paragraph)
     const UniChar *source = Source(editor) + paragraph->start;
     const uint16_t *styles = editor->styles + paragraph->start;
     ATSUStyle style;
-    OSStatus status = GetStyle(editor, styles[0] & kMarkdownDisplayMask, &style);
+    OSStatus status = GetStyle(editor, styles[0] & kMarkdownDisplayMask, false, &style);
     if(status != noErr)
         return status;
     status = ATSUCreateTextLayoutWithTextPtr(source, 0, length, length, 1, &length,
@@ -577,12 +593,36 @@ static OSStatus MakeLayout(Editor *editor, LayoutSpan *paragraph)
         for(end = start + 1; end < length && (styles[end] & kMarkdownDisplayMask) == flags; ++end)
             ;
         if(start != 0) {
-            status = GetStyle(editor, flags, &style);
+            status = GetStyle(editor, flags, false, &style);
             if(status == noErr)
                 status = ATSUSetRunStyle(paragraph->layout, style, start, end - start);
         }
     }
     return status;
+}
+
+static OSStatus StyleLayoutRow(Editor *editor, LayoutSpan *paragraph, unsigned line,
+                               Boolean dimmed)
+{
+    if(paragraph->length == 0)
+        return noErr;
+    unsigned first = line != 0 ? paragraph->breaks[line - 1] : 0;
+    unsigned last = paragraph->breaks[line];
+    const uint16_t *styles = editor->styles + paragraph->start;
+    for(unsigned start = first, end; start < last; start = end) {
+        unsigned flags = styles[start] & kMarkdownDisplayMask;
+        for(end = start + 1; end < last &&
+            (styles[end] & kMarkdownDisplayMask) == flags; ++end)
+            ;
+        ATSUStyle style;
+        OSStatus status = GetStyle(editor, flags, dimmed, &style);
+        if(status != noErr)
+            return status;
+        status = ATSUSetRunStyle(paragraph->layout, style, start, end - start);
+        if(status != noErr)
+            return status;
+    }
+    return noErr;
 }
 
 static OSStatus Wrap(Editor *editor, LayoutSpan *paragraph)
@@ -839,19 +879,24 @@ static Boolean Before(Position a, Position b)
     return a.start < b.start || (a.start == b.start && a.line < b.line);
 }
 
-static Position CaretRow(Editor *editor)
+static Position CaretRowAt(Editor *editor, unsigned offset, Boolean trailing)
 {
-    Position row = PositionAt(editor, editor->caret);
-    if(editor->trailing && SourceOffset(editor, row) == editor->caret) {
+    Position row = PositionAt(editor, offset);
+    if(trailing && SourceOffset(editor, row) == offset) {
         Position previous = row;
         if(Step(editor, &previous, false)) {
             LayoutSpan *span = Layout(editor, previous.start);
             if(span != NULL && span->length != 0 &&
-               previous.start + span->breaks[previous.line] == editor->caret)
+               previous.start + span->breaks[previous.line] == offset)
                 return previous;
         }
     }
     return row;
+}
+
+static Position CaretRow(Editor *editor)
+{
+    return CaretRowAt(editor, editor->caret, editor->trailing);
 }
 
 static Fixed CaretX(const LayoutSpan *span, unsigned line, unsigned offset)
@@ -892,6 +937,26 @@ static RowMetrics MetricsAt(Editor *editor, Position row)
 {
     LayoutSpan *span = Layout(editor, row.start);
     return editor->metrics[span != NULL ? span->heading : 0];
+}
+
+/* Typewriter mode may deliberately leave blank paper above the first row.
+   This is what lets a short note, or the opening rows of a longer note, keep
+   the caret on the focus line instead of pinning it to the top of the view. */
+static short ContentTop(Editor *editor)
+{
+    short top = editor->view.top;
+    if(!editor->typewriter)
+        return top;
+    Position row = editor->top, caret = CaretRow(editor);
+    short y = top;
+    while(Before(row, caret)) {
+        y += MetricsAt(editor, row).height;
+        if(!Step(editor, &row, true))
+            break;
+    }
+    short target = editor->view.top +
+        (editor->view.bottom - editor->view.top - MetricsAt(editor, caret).height) / 2;
+    return y < target ? top + target - y : top;
 }
 
 /* Keep the starting row visible even if the window is shorter than that row. */
@@ -947,8 +1012,9 @@ static unsigned ScrollMaximum(const Editor *editor)
     return maximum;
 }
 
-static void InvalidateWritingSurface(const Editor *editor)
+static void InvalidateWritingSurface(Editor *editor)
 {
+    editor->caretOnlyPending = false;
     Rect writing = editor->view;
     if(!EmptyRect(&editor->outline))
         writing.right = editor->outline.left;
@@ -959,7 +1025,9 @@ static void InvalidateWritingSurface(const Editor *editor)
 
 static void ScrollTo(Editor *editor, Position position)
 {
-    if(editor->lastPageKnown && Before(editor->lastPage, position))
+    /* A typewriter viewport is allowed to end in blank paper. Clamping it to
+       the ordinary last page makes drawing and caret centering fight forever. */
+    if(!editor->typewriter && editor->lastPageKnown && Before(editor->lastPage, position))
         position = editor->lastPage;
     if(position.start != editor->top.start || position.line != editor->top.line) {
         editor->top = position;
@@ -984,6 +1052,7 @@ Boolean EditorSetTypography(Editor *editor, EditorTypography typography)
     editor->lastPageKnown = false;
     ResetSplits(editor);
     editor->layoutError = noErr;
+    editor->caretOnlyPending = false;
     ScrollTo(editor, PositionAt(editor, offset));
     InvalidateRect(&editor->view);
     return true;
@@ -1062,7 +1131,8 @@ static unsigned SpellingMarkAt(const Editor *editor, unsigned offset)
     return first;
 }
 
-static void PaintSpelling(Editor *editor, LayoutSpan *span, Position row, Fixed x, short y)
+static void PaintSpelling(Editor *editor, LayoutSpan *span, Position row, Fixed x, short y,
+                          Boolean dimmed)
 {
     if(editor->spellingCount == 0 || span->length == 0)
         return;
@@ -1071,6 +1141,13 @@ static void PaintSpelling(Editor *editor, LayoutSpan *span, Position row, Fixed 
     RGBColor ink = editor->theme->page.red < 0x8000
         ? (RGBColor){0xa6a6, 0x6767, 0x6767}
         : (RGBColor){0xa6a6, 0x5858, 0x5858};
+    if(dimmed) {
+        ink = (RGBColor){
+            (3u * ink.red + 2u * editor->theme->page.red) / 5,
+            (3u * ink.green + 2u * editor->theme->page.green) / 5,
+            (3u * ink.blue + 2u * editor->theme->page.blue) / 5
+        };
+    }
     for(unsigned i = SpellingMarkAt(editor, first); i < editor->spellingCount; ++i) {
         SpellingMark mark = editor->spellingMarks[i];
         if(mark.start >= end)
@@ -1087,22 +1164,54 @@ static void PaintSpelling(Editor *editor, LayoutSpan *span, Position row, Fixed 
     }
 }
 
+static Boolean FocusDimsRow(const Editor *editor, Position row, Position focus,
+                            unsigned paragraphStart, unsigned paragraphEnd,
+                            unsigned rowOffset)
+{
+    if(editor->focusMode == kEditorFocusLine)
+        return row.start != focus.start || row.line != focus.line;
+    if(editor->focusMode == kEditorFocusParagraph) {
+        unsigned rowStart = row.start + rowOffset;
+        return rowStart < paragraphStart || rowStart > paragraphEnd;
+    }
+    return false;
+}
+
 static Boolean PaintText(Editor *editor, const Rect *text)
 {
     editor->layoutError = noErr;
     RGBBackColor(&editor->theme->page);
     EraseRect(text);
     Position position = editor->top;
+    Position focus = CaretRow(editor);
+    unsigned paragraphStart = editor->caret, paragraphEnd = editor->caret;
+    if(editor->focusMode == kEditorFocusParagraph) {
+        const UniChar *source = Source(editor);
+        while(paragraphStart != 0 && source[paragraphStart - 1] != '\r')
+            --paragraphStart;
+        while(paragraphEnd < editor->length && source[paragraphEnd] != '\r')
+            ++paragraphEnd;
+    }
     Boolean more = false;
-    for(short top = text->top;;) {
+    short contentTop = text->top + ContentTop(editor) - editor->view.top;
+    for(short top = contentTop;;) {
         LayoutSpan *paragraph = Layout(editor, position.start);
         if(paragraph == NULL)
             break;
         RowMetrics metrics = editor->metrics[paragraph->heading];
-        if(top != text->top && top + metrics.height > text->bottom)
+        if(top != contentTop && top + metrics.height > text->bottom)
             break;
         short baseline = top + metrics.baseline;
         Fixed x = (Fixed)text->left << 16;
+        Boolean dimmed = FocusDimsRow(editor, position, focus, paragraphStart, paragraphEnd,
+                                      LineOffset(paragraph, position.line));
+        if(editor->focusMode != kEditorFocusNone) {
+            OSStatus status = StyleLayoutRow(editor, paragraph, position.line, dimmed);
+            if(status != noErr) {
+                editor->layoutError = status;
+                break;
+            }
+        }
         Boolean selection = editor->anchor != editor->caret;
         if(editor->active && selection)
             PaintSelection(editor, paragraph, position, x, baseline);
@@ -1115,9 +1224,7 @@ static Boolean PaintText(Editor *editor, const Rect *text)
                 break;
             }
         }
-        PaintSpelling(editor, paragraph, position, x, baseline + 2);
-        if(editor->active && !selection)
-            PaintSelection(editor, paragraph, position, x, baseline);
+        PaintSpelling(editor, paragraph, position, x, baseline + 2, dimmed);
         more = Step(editor, &position, true);
         if(!more)
             break;
@@ -1134,6 +1241,27 @@ static Boolean PaintText(Editor *editor, const Rect *text)
     return more;
 }
 
+static void PaintCaret(Editor *editor, const Rect *text)
+{
+    if(!editor->active || editor->anchor != editor->caret)
+        return;
+    Position caret = CaretRow(editor), row = editor->top;
+    if(Before(caret, row))
+        return;
+    short top = text->top + ContentTop(editor) - editor->view.top;
+    while(Before(row, caret)) {
+        top += MetricsAt(editor, row).height;
+        if(!Step(editor, &row, true) || top >= text->bottom)
+            return;
+    }
+    LayoutSpan *span = Layout(editor, caret.start);
+    if(span != NULL) {
+        RowMetrics metrics = editor->metrics[span->heading];
+        PaintSelection(editor, span, caret, (Fixed)text->left << 16,
+                       top + metrics.baseline);
+    }
+}
+
 void EditorDraw(Editor *editor)
 {
     Rect text = TextBounds(editor);
@@ -1142,13 +1270,25 @@ void EditorDraw(Editor *editor)
     if(editor->buffer == NULL)
         NewGWorld(&editor->buffer, 0, &canvas, NULL, NULL, useTempMem);
     PixMapHandle pixels = editor->buffer != NULL ? GetGWorldPixMap(editor->buffer) : NULL;
-    Boolean more;
+    GetClip(editor->clip);
+    Rect clip;
+#if TARGET_API_MAC_CARBON
+    GetRegionBounds(editor->clip, &clip);
+#else
+    clip = (*editor->clip)->rgnBBox;
+#endif
+    Rect clipped;
+    Boolean clipInsideText = SectRect(&clip, &text, &clipped) && EqualRect(&clip, &clipped);
+    Boolean caretOnly = editor->caretOnlyPending && editor->buffer != NULL && clipInsideText;
+    editor->caretOnlyPending = false;
+    Boolean more = editor->moreBelow;
     if(pixels != NULL && LockPixels(pixels)) {
         CGrafPtr port;
         GDHandle device;
         GetGWorld(&port, &device);
         SetGWorld(editor->buffer, NULL);
-        more = PaintText(editor, &canvas);
+        if(!caretOnly)
+            more = PaintText(editor, &canvas);
         SetGWorld(port, device);
         RGBColor foreground;
         GetForeColor(&foreground);
@@ -1164,7 +1304,7 @@ void EditorDraw(Editor *editor)
         RGBForeColor(&foreground);
         UnlockPixels(pixels);
     } else {
-        GetClip(editor->clip);
+        caretOnly = false;
         RectRgn(editor->highlight, &text);
         SectRgn(editor->highlight, editor->clip, editor->highlight);
         SetClip(editor->highlight);
@@ -1172,7 +1312,13 @@ void EditorDraw(Editor *editor)
         SetClip(editor->clip);
     }
 
-    if(!more && editor->splitsKnown && editor->layoutError == noErr) {
+    editor->moreBelow = more;
+    PaintCaret(editor, &text);
+
+    if(caretOnly)
+        return;
+
+    if(!editor->typewriter && !more && editor->splitsKnown && editor->layoutError == noErr) {
         BottomPage(editor);
         ScrollTo(editor, editor->top);
     }
@@ -1204,6 +1350,7 @@ void EditorDraw(Editor *editor)
 
 void EditorResize(Editor *editor, const Rect *view, const Rect *outline)
 {
+    editor->caretOnlyPending = false;
     unsigned offset = SourceOffset(editor, editor->top);
     Boolean wasVisible = !EmptyRect(&editor->outline);
     DisposeLayout(&editor->paragraph);
@@ -1270,8 +1417,6 @@ static void ShowCaret(Editor *editor)
             }
         }
     }
-    Rect text = TextBounds(editor);
-    InvalidateRect(&text);
 }
 
 void EditorSetTypewriter(Editor *editor, Boolean enabled)
@@ -1279,18 +1424,79 @@ void EditorSetTypewriter(Editor *editor, Boolean enabled)
     editor->typewriter = enabled;
     if(enabled)
         ShowCaret(editor);
+    InvalidateWritingSurface(editor);
+}
+
+void EditorSetFocusMode(Editor *editor, unsigned mode)
+{
+    if(mode > kEditorFocusParagraph)
+        mode = kEditorFocusNone;
+    if(editor->focusMode == mode)
+        return;
+    editor->focusMode = mode;
+    DisposeLayout(&editor->paragraph);
+    InvalidateWritingSurface(editor);
 }
 
 static void Select(Editor *editor, unsigned offset, Boolean trailing, Boolean extend)
 {
     Boolean updateOutline = !editor->stylePending && editor->headingCount != 0;
     unsigned heading = updateOutline ? EditorOutlineCurrent(editor) : 0;
+    unsigned oldAnchor = editor->anchor, oldCaret = editor->caret;
+    Position oldTop = editor->top;
+    Boolean oldSelectionValid = oldAnchor <= editor->length && oldCaret <= editor->length;
+    short oldContentTop = oldSelectionValid ? ContentTop(editor) : -32768;
+    Boolean oldTrailing = editor->trailing;
     editor->typing = false;
     if(!extend)
         editor->anchor = offset;
     editor->caret = offset;
     editor->trailing = trailing;
     ShowCaret(editor);
+    Rect text = TextBounds(editor);
+    Position oldRow = oldSelectionValid ? CaretRowAt(editor, oldCaret, oldTrailing)
+                                         : (Position){0, 0};
+    Position newRow = CaretRow(editor);
+    Boolean focusRowChanged = editor->focusMode == kEditorFocusLine &&
+        (oldRow.start != newRow.start || oldRow.line != newRow.line);
+    Boolean focusParagraphChanged = false;
+    if(editor->focusMode == kEditorFocusParagraph && oldSelectionValid) {
+        const UniChar *source = Source(editor);
+        unsigned oldStart = oldCaret, newStart = editor->caret;
+        while(oldStart != 0 && source[oldStart - 1] != '\r')
+            --oldStart;
+        while(newStart != 0 && source[newStart - 1] != '\r')
+            --newStart;
+        focusParagraphChanged = oldStart != newStart;
+    }
+    /* Selection highlights, edits, scrolling, and an early typewriter row can
+       affect more than the two caret slivers. Plain cursor motion cannot. */
+    if(!oldSelectionValid || oldAnchor != oldCaret || editor->anchor != editor->caret ||
+       oldTop.start != editor->top.start || oldTop.line != editor->top.line ||
+       oldContentTop != ContentTop(editor) || focusRowChanged || focusParagraphChanged) {
+        editor->caretOnlyPending = false;
+        InvalidateRect(&text);
+    } else {
+        editor->caretOnlyPending = true;
+        Position rows[2] = {oldRow, newRow};
+        unsigned offsets[2] = {oldCaret, editor->caret};
+        for(unsigned i = 0; i < 2; ++i) {
+            Position row = editor->top;
+            short top = ContentTop(editor);
+            while(Before(row, rows[i])) {
+                top += MetricsAt(editor, row).height;
+                if(!Step(editor, &row, true))
+                    break;
+            }
+            LayoutSpan *span = Layout(editor, rows[i].start);
+            if(span != NULL) {
+                Rect caret = CaretBounds(editor, span, rows[i], offsets[i],
+                    (Fixed)text.left << 16, top + editor->metrics[span->heading].baseline);
+                InsetRect(&caret, -1, -1);
+                InvalidateRect(&caret);
+            }
+        }
+    }
     if(updateOutline && heading != EditorOutlineCurrent(editor))
         InvalidateRect(&editor->outline);
 }
@@ -1372,7 +1578,7 @@ void EditorJumpToHeading(Editor *editor, unsigned index)
 
 static Boolean RowAtPoint(Editor *editor, Point point, Position *row, short *top)
 {
-    *top = editor->view.top;
+    *top = ContentTop(editor);
     *row = editor->top;
     short bottom = *top + MetricsAt(editor, *row).height;
     while(point.v >= bottom) {
@@ -1410,7 +1616,7 @@ RgnHandle EditorTextDragRegion(Editor *editor, Point point)
         return NULL;
     Fixed x = (Fixed)text.left << 16;
     Position row = editor->top;
-    short top = text.top;
+    short top = ContentTop(editor);
     do {
         LayoutSpan *span = Layout(editor, row.start);
         if(span == NULL)
@@ -1784,6 +1990,7 @@ static Boolean Splice(Editor *editor, unsigned start, unsigned end, const UniCha
     WorkspaceEdited(editor->workspace);
     InvalidateCounter(editor);
     Select(editor, caret, false, false);
+    InvalidateWritingSurface(editor);
     editor->typing = typing;
     editor->typedAt = now;
     return true;
@@ -3384,6 +3591,7 @@ void EditorIdle(Editor *editor)
 void EditorActivate(Editor *editor, Boolean active)
 {
     editor->active = active;
+    editor->caretOnlyPending = false;
     InvalidateRect(&editor->view);
 }
 
@@ -3412,8 +3620,8 @@ Boolean EditorTypographyMatches(Editor *editor, EditorTypography typography)
     Fixed bodySize, titleSize;
     ByteCount size;
     return ATSUFONDtoFontID(typography.family, normal, &expectedFont) == noErr &&
-           GetStyle(editor, 0, &body) == noErr &&
-           GetStyle(editor, 1 | kMarkdownBold, &title) == noErr &&
+           GetStyle(editor, 0, false, &body) == noErr &&
+           GetStyle(editor, 1 | kMarkdownBold, false, &title) == noErr &&
            ATSUGetAttribute(body, kATSUFontTag, sizeof(actualFont), &actualFont, &size) == noErr &&
            ATSUGetAttribute(body, kATSUSizeTag, sizeof(bodySize), &bodySize, &size) == noErr &&
            ATSUGetAttribute(title, kATSUSizeTag, sizeof(titleSize), &titleSize, &size) == noErr &&
@@ -3815,6 +4023,7 @@ static const char *CheckWritingSurface(Editor *editor)
     Point point = {column.top + 1, column.left + 32};
     if(HitPoint(editor, point, &(Position){0}, &trailing) != 1)
         return "FAIL: centered column hit testing used the wrong origin";
+    EditorSetFocusMode(editor, kEditorFocusLine);
     EditorSetTypewriter(editor, true);
     Select(editor, 80, false, false);
     Position row = editor->top, caret = CaretRow(editor);
@@ -3833,13 +4042,83 @@ static const char *CheckWritingSurface(Editor *editor)
     EditorClick(editor, &click);
     if(EditorTopOffset(editor) != top)
         return "FAIL: typewriter scrolling shifted the viewport during mouse selection";
+
+    Select(editor, editor->length, true, false);
+    Position endTop = editor->top;
+    EditorDraw(editor);
+    if(editor->top.start != endTop.start || editor->top.line != endTop.line)
+        return "FAIL: drawing the typewriter document end snapped away from the caret";
+    RGBColor dimColor;
+    ByteCount colorSize;
+    RGBColor expectedDim = {
+        (3u * editor->theme->text.red + 2u * editor->theme->page.red) / 5,
+        (3u * editor->theme->text.green + 2u * editor->theme->page.green) / 5,
+        (3u * editor->theme->text.blue + 2u * editor->theme->page.blue) / 5
+    };
+    if(editor->dimRuns[0] == NULL ||
+       ATSUGetAttribute(editor->dimRuns[0], kATSUColorTag, sizeof(dimColor),
+                        &dimColor, &colorSize) != noErr ||
+       dimColor.red != expectedDim.red || dimColor.green != expectedDim.green ||
+       dimColor.blue != expectedDim.blue)
+        return "FAIL: focused rows did not use the dimmed theme color";
     EditorSetTypewriter(editor, false);
+    EditorSetFocusMode(editor, kEditorFocusNone);
     BottomPage(editor);
     unsigned maximum = ScrollMaximum(editor);
     EventRecord newline = {.what = keyDown, .message = '\r'};
     EditorKey(editor, &newline);
     if(editor->lastPageKnown || maximum == 0 || ScrollMaximum(editor) != maximum)
         return "FAIL: Return switched the scrollbar to an estimated range";
+
+    static const UniChar shortNote[] = u"short note";
+    source = NewHandle(sizeof(shortNote) - sizeof(*shortNote));
+    if(source == NULL)
+        return "FAIL: allocate the short typewriter fixture";
+    memcpy(*source, shortNote, sizeof(shortNote) - sizeof(*shortNote));
+    if(EditorTakeText(editor, source) != noErr) {
+        DisposeHandle(source);
+        return "FAIL: load the short typewriter fixture";
+    }
+    EditorSetTypewriter(editor, true);
+    Select(editor, editor->length, true, false);
+    short focusTop = ContentTop(editor);
+    short focusHeight = MetricsAt(editor, CaretRow(editor)).height;
+    if(abs(2 * (focusTop - editor->view.top) + focusHeight -
+           (editor->view.bottom - editor->view.top)) >= 2)
+        return "FAIL: short typewriter note did not place the caret row at the focus line";
+    endTop = editor->top;
+    EditorDraw(editor);
+    if(editor->top.start != endTop.start || editor->top.line != endTop.line ||
+       ContentTop(editor) != focusTop)
+        return "FAIL: short typewriter note did not keep a stable viewport";
+    EditorSetTypewriter(editor, false);
+
+    source = NewHandle(242 * sizeof(UniChar));
+    if(source == NULL)
+        return "FAIL: allocate the paragraph-focus fixture";
+    for(unsigned i = 0; i < 240; ++i)
+        ((UniChar *)*source)[i] = 'x';
+    ((UniChar *)*source)[240] = '\r';
+    ((UniChar *)*source)[241] = 'z';
+    if(EditorTakeText(editor, source) != noErr) {
+        DisposeHandle(source);
+        return "FAIL: load the paragraph-focus fixture";
+    }
+    Select(editor, 100, false, false);
+    EditorSetFocusMode(editor, kEditorFocusParagraph);
+    LayoutSpan *wrapped = Layout(editor, 0);
+    Position paragraphFocus = CaretRow(editor);
+    Position secondRow = {0, 1};
+    if(wrapped == NULL || wrapped->count < 2)
+        return "FAIL: paragraph-focus fixture did not wrap";
+    unsigned focusOffset = LineOffset(wrapped, paragraphFocus.line);
+    unsigned secondOffset = LineOffset(wrapped, secondRow.line);
+    Position nextParagraph = PositionAt(editor, 241);
+    if(FocusDimsRow(editor, paragraphFocus, paragraphFocus, 0, 240, focusOffset) ||
+       FocusDimsRow(editor, secondRow, paragraphFocus, 0, 240, secondOffset) ||
+       !FocusDimsRow(editor, nextParagraph, paragraphFocus, 0, 240, 0))
+        return "FAIL: Paragraph Focus did not include every wrapped row";
+    EditorSetFocusMode(editor, kEditorFocusNone);
     EditorResize(editor, &view, NULL);
     return NULL;
 }

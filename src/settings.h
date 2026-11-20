@@ -13,6 +13,7 @@ typedef struct {
     signed char lineSpacing;
     Boolean sidebarVisible;
     Boolean typewriter;
+    unsigned char focusMode;
     Boolean outlineVisible;
     Boolean liveSpelling;
     unsigned char counter;

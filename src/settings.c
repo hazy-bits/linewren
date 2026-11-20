@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "editor.h"
 
 #include <Aliases.h>
 #include <Folders.h>
@@ -6,8 +7,11 @@
 #include <TextUtils.h>
 #include <string.h>
 
-enum { kSettingsMagic = 'LnwP', kSettingsVersion = 3 };
-enum { kSidebarFlag = 1, kTypewriterFlag = 2, kCounterShift = 2, kOutlineFlag = 16, kLiveSpellingFlag = 32 };
+enum { kSettingsMagic = 'LnwP', kSettingsVersion = 4 };
+enum {
+    kSidebarFlag = 1, kTypewriterFlag = 2, kCounterShift = 2,
+    kOutlineFlag = 16, kLiveSpellingFlag = 32, kFocusShift = 6
+};
 
 typedef struct {
     unsigned long magic;
@@ -160,6 +164,13 @@ static OSErr LoadSettingsFile(const FSSpec *file, AppSettings *settings)
             unsigned counter = (header.viewFlags >> kCounterShift) & 3;
             if(counter <= kCounterHidden)
                 settings->counter = counter;
+            if(header.version >= 4) {
+                unsigned focus = header.viewFlags >> kFocusShift;
+                if(focus <= kEditorFocusParagraph)
+                    settings->focusMode = focus;
+            } else if(settings->typewriter) {
+                settings->focusMode = kEditorFocusLine;
+            }
         }
         settings->window = header.window;
         memcpy(settings->font, header.font, sizeof(settings->font));
@@ -197,6 +208,7 @@ static OSErr SaveSettingsFile(const FSSpec *file, const AppSettings *settings)
                               (settings->typewriter ? kTypewriterFlag : 0) |
                               (settings->outlineVisible ? kOutlineFlag : 0) |
                               (settings->liveSpelling ? kLiveSpellingFlag : 0) |
+                              (settings->focusMode << kFocusShift) |
                               (settings->counter << kCounterShift);
     SettingsHeader header = {
         kSettingsMagic, kSettingsVersion, settings->theme, settings->points,
@@ -245,7 +257,8 @@ Boolean SettingsSmokeRecent(const AppSettings *settings)
     SettingsDefaults(&loaded);
     Boolean matches = SaveSettingsFile(&fixture, settings) == noErr &&
                       LoadSettingsFile(&fixture, &loaded) == noErr &&
-                      loaded.recentCount == settings->recentCount;
+                      loaded.recentCount == settings->recentCount &&
+                      loaded.focusMode == settings->focusMode;
     for(unsigned i = 0; matches && i < loaded.recentCount; ++i) {
         matches = loaded.recent[i].parID == settings->recent[i].parID &&
                   EqualString(loaded.recent[i].name, settings->recent[i].name, true, true);

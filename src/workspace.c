@@ -1790,10 +1790,15 @@ static void NameFieldFont(DialogRef dialog, ScriptCode script)
 
 static pascal Boolean NameFilter(DialogRef dialog, EventRecord *event, DialogItemIndex *item)
 {
-    (void)item;
-    if((event->what == keyDown || event->what == autoKey) &&
-       (event->message & charCodeMask) >= 0x80)
-        NameFieldFont(dialog, GetScriptManagerVariable(smKeyScript));
+    if(event->what == keyDown || event->what == autoKey) {
+        unsigned char key = event->message & charCodeMask;
+        if(key == '\r' || key == 0x03) {
+            *item = 1;
+            return true;
+        }
+        if(key >= 0x80)
+            NameFieldFont(dialog, GetScriptManagerVariable(smKeyScript));
+    }
     return false;
 }
 #endif
@@ -2278,6 +2283,15 @@ const char *WorkspaceSmokeTest(Editor *editor, WindowRef window, WorkspaceSmokeC
     FSSpec file, second;
     Handle bytes = NewHandle(sizeof(changed) - 1), saved = NULL;
     Boolean created = false, secondCreated = false;
+
+#if !TARGET_API_MAC_CARBON
+    DialogItemIndex accepted = 0;
+    EventRecord returnKey = {.what = keyDown, .message = '\r'};
+    EventRecord enterKey = {.what = keyDown, .message = 0x03};
+    if(!NameFilter(NULL, &returnKey, &accepted) || accepted != 1 ||
+       !(accepted = 0, NameFilter(NULL, &enterKey, &accepted)) || accepted != 1)
+        return "FAIL: Return or Enter did not accept the single-line name field";
+#endif
 
     if(bytes == NULL)
         return result;
