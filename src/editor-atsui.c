@@ -37,7 +37,7 @@ enum {
     kDefaultLineSpacing = -2, kCaretDescent = 2, kScrollbarMax = 1000,
     kLayoutSpan = 1024, kMaxSplits = 2 * kTextFileLimit / kLayoutSpan,
     kStyleDelay = 8, kUndoLimit = 12, kUndoBytes = 256 * 1024, kScrollbarGutter = 6,
-    kIdleWrapBudget = 4
+    kIdleWrapBudget = 4, kVisibleRowLimit = 128
 };
 
 typedef struct {
@@ -90,6 +90,12 @@ struct Editor {
     Boolean trailing, active, markdown, stylePending, typewriter, trackingSelection;
     unsigned char focusMode;
     Boolean caretOnlyPending, moreBelow;
+    Boolean contentTopKnown, rowTopKnown;
+    Position contentTopCaret, contentTopViewport, rowTopRow, rowTopViewport;
+    short cachedContentTop, cachedRowTop;
+    unsigned visibleRowCount;
+    Position visibleRows[kVisibleRowLimit];
+    short visibleRowTops[kVisibleRowLimit], visibleRowHeights[kVisibleRowLimit];
     unsigned long styleAt;
     unsigned long clickAt;
     Point clickPoint;
@@ -132,8 +138,16 @@ struct Editor {
 #endif
 };
 
+static void ForgetCaretGeometry(Editor *editor)
+{
+    editor->contentTopKnown = false;
+    editor->rowTopKnown = false;
+    editor->visibleRowCount = 0;
+}
+
 #ifdef LINEWREN_SMOKE_TEST
 static long gStyleFreeHeap;
+static unsigned gStepCount;
 static Boolean gCaptureWebURL;
 static UniChar gCapturedWebURL[2048];
 static unsigned gCapturedWebLength;
@@ -387,6 +401,7 @@ Workspace *EditorWorkspace(Editor *editor) { return editor->workspace; }
 void EditorSetTheme(Editor *editor, const EditorTheme *theme)
 {
     editor->caretOnlyPending = false;
+    ForgetCaretGeometry(editor);
     DropStyles(editor);
     editor->theme = theme;
     editor->layoutError = noErr;
@@ -488,6 +503,7 @@ OSStatus EditorTakeDocument(Editor *editor, Handle text, Boolean markdown)
     ResetSplits(editor);
     editor->layoutError = noErr;
     editor->caretOnlyPending = false;
+    ForgetCaretGeometry(editor);
     InvalidateRect(&editor->view);
     return noErr;
 }
@@ -848,6 +864,9 @@ static Position PositionAt(Editor *editor, unsigned offset)
 
 static Boolean Step(Editor *editor, Position *position, Boolean forward)
 {
+#ifdef LINEWREN_SMOKE_TEST
+    ++gStepCount;
+#endif
     LayoutSpan *paragraph = Layout(editor, position->start);
     if(paragraph == NULL)
         return false;
@@ -947,7 +966,14 @@ static short ContentTop(Editor *editor)
     short top = editor->view.top;
     if(!editor->typewriter)
         return top;
-    Position row = editor->top, caret = CaretRow(editor);
+    Position caret = CaretRow(editor);
+    if(editor->contentTopKnown &&
+       editor->contentTopCaret.start == caret.start &&
+       editor->contentTopCaret.line == caret.line &&
+       editor->contentTopViewport.start == editor->top.start &&
+       editor->contentTopViewport.line == editor->top.line)
+        return editor->cachedContentTop;
+    Position row = editor->top;
     short y = top;
     while(Before(row, caret)) {
         y += MetricsAt(editor, row).height;
@@ -956,7 +982,54 @@ static short ContentTop(Editor *editor)
     }
     short target = editor->view.top +
         (editor->view.bottom - editor->view.top - MetricsAt(editor, caret).height) / 2;
-    return y < target ? top + target - y : top;
+    editor->contentTopCaret = caret;
+    editor->contentTopViewport = editor->top;
+    editor->cachedContentTop = y < target ? top + target - y : top;
+    editor->contentTopKnown = true;
+    return editor->cachedContentTop;
+}
+
+static unsigned VisibleRowIndex(const Editor *editor, Position target)
+{
+    for(unsigned i = 0; i < editor->visibleRowCount; ++i) {
+        Position row = editor->visibleRows[i];
+        if(row.start == target.start && row.line == target.line)
+            return i;
+    }
+    return editor->visibleRowCount;
+}
+
+static Boolean VisibleRowTop(Editor *editor, Position target, short *top)
+{
+    unsigned visible = VisibleRowIndex(editor, target);
+    if(visible < editor->visibleRowCount) {
+        *top = editor->visibleRowTops[visible];
+        return true;
+    }
+    if(editor->rowTopKnown &&
+       editor->rowTopRow.start == target.start && editor->rowTopRow.line == target.line &&
+       editor->rowTopViewport.start == editor->top.start &&
+       editor->rowTopViewport.line == editor->top.line) {
+        *top = editor->cachedRowTop;
+        return true;
+    }
+    Position row = editor->top;
+    if(Before(target, row))
+        return false;
+    short y = ContentTop(editor);
+    while(Before(row, target)) {
+        y += MetricsAt(editor, row).height;
+        if(!Step(editor, &row, true) || y >= editor->view.bottom)
+            return false;
+    }
+    if(row.start != target.start || row.line != target.line)
+        return false;
+    editor->rowTopRow = target;
+    editor->rowTopViewport = editor->top;
+    editor->cachedRowTop = y;
+    editor->rowTopKnown = true;
+    *top = y;
+    return true;
 }
 
 /* Keep the starting row visible even if the window is shorter than that row. */
@@ -1015,6 +1088,7 @@ static unsigned ScrollMaximum(const Editor *editor)
 static void InvalidateWritingSurface(Editor *editor)
 {
     editor->caretOnlyPending = false;
+    ForgetCaretGeometry(editor);
     Rect writing = editor->view;
     if(!EmptyRect(&editor->outline))
         writing.right = editor->outline.left;
@@ -1053,6 +1127,7 @@ Boolean EditorSetTypography(Editor *editor, EditorTypography typography)
     ResetSplits(editor);
     editor->layoutError = noErr;
     editor->caretOnlyPending = false;
+    ForgetCaretGeometry(editor);
     ScrollTo(editor, PositionAt(editor, offset));
     InvalidateRect(&editor->view);
     return true;
@@ -1180,6 +1255,7 @@ static Boolean FocusDimsRow(const Editor *editor, Position row, Position focus,
 static Boolean PaintText(Editor *editor, const Rect *text)
 {
     editor->layoutError = noErr;
+    ForgetCaretGeometry(editor);
     RGBBackColor(&editor->theme->page);
     EraseRect(text);
     Position position = editor->top;
@@ -1202,6 +1278,18 @@ static Boolean PaintText(Editor *editor, const Rect *text)
         if(top != contentTop && top + metrics.height > text->bottom)
             break;
         short baseline = top + metrics.baseline;
+        if(editor->visibleRowCount < kVisibleRowLimit) {
+            unsigned visible = editor->visibleRowCount++;
+            editor->visibleRows[visible] = position;
+            editor->visibleRowTops[visible] = top + editor->view.top - text->top;
+            editor->visibleRowHeights[visible] = metrics.height;
+        }
+        if(position.start == focus.start && position.line == focus.line) {
+            editor->rowTopRow = focus;
+            editor->rowTopViewport = editor->top;
+            editor->cachedRowTop = top + editor->view.top - text->top;
+            editor->rowTopKnown = true;
+        }
         Fixed x = (Fixed)text->left << 16;
         Boolean dimmed = FocusDimsRow(editor, position, focus, paragraphStart, paragraphEnd,
                                       LineOffset(paragraph, position.line));
@@ -1245,15 +1333,10 @@ static void PaintCaret(Editor *editor, const Rect *text)
 {
     if(!editor->active || editor->anchor != editor->caret)
         return;
-    Position caret = CaretRow(editor), row = editor->top;
-    if(Before(caret, row))
+    Position caret = CaretRow(editor);
+    short top;
+    if(!VisibleRowTop(editor, caret, &top))
         return;
-    short top = text->top + ContentTop(editor) - editor->view.top;
-    while(Before(row, caret)) {
-        top += MetricsAt(editor, row).height;
-        if(!Step(editor, &row, true) || top >= text->bottom)
-            return;
-    }
     LayoutSpan *span = Layout(editor, caret.start);
     if(span != NULL) {
         RowMetrics metrics = editor->metrics[span->heading];
@@ -1351,6 +1434,7 @@ void EditorDraw(Editor *editor)
 void EditorResize(Editor *editor, const Rect *view, const Rect *outline)
 {
     editor->caretOnlyPending = false;
+    ForgetCaretGeometry(editor);
     unsigned offset = SourceOffset(editor, editor->top);
     Boolean wasVisible = !EmptyRect(&editor->outline);
     DisposeLayout(&editor->paragraph);
@@ -1395,7 +1479,34 @@ static void ClickScrollbar(Editor *editor, Point point)
 static void ShowCaret(Editor *editor)
 {
     Position row = CaretRow(editor);
+    unsigned cached = VisibleRowIndex(editor, row);
     if(editor->typewriter && !editor->trackingSelection) {
+        if(cached < editor->visibleRowCount) {
+            short target = (editor->view.bottom - editor->view.top -
+                            editor->visibleRowHeights[cached]) / 2;
+            short padding = target;
+            unsigned first = cached;
+            while(first != 0) {
+                short height = editor->visibleRowHeights[first - 1];
+                if(height > padding)
+                    break;
+                padding -= height;
+                --first;
+            }
+            if(first != 0 || (editor->top.start == 0 && editor->top.line == 0)) {
+                Position viewport = editor->visibleRows[first];
+                ScrollTo(editor, viewport);
+                editor->contentTopCaret = row;
+                editor->contentTopViewport = viewport;
+                editor->cachedContentTop = editor->view.top + padding;
+                editor->contentTopKnown = true;
+                editor->rowTopRow = row;
+                editor->rowTopViewport = viewport;
+                editor->cachedRowTop = editor->view.top + target;
+                editor->rowTopKnown = true;
+                return;
+            }
+        }
         short remaining = (editor->view.bottom - editor->view.top - MetricsAt(editor, row).height) / 2;
         Position previous = row;
         while(Step(editor, &previous, false)) {
@@ -1405,6 +1516,8 @@ static void ShowCaret(Editor *editor)
             row = previous;
         }
         ScrollTo(editor, row);
+    } else if(cached < editor->visibleRowCount) {
+        return;
     } else if(Before(row, editor->top)) {
         ScrollTo(editor, row);
     } else {
@@ -1421,6 +1534,7 @@ static void ShowCaret(Editor *editor)
 
 void EditorSetTypewriter(Editor *editor, Boolean enabled)
 {
+    ForgetCaretGeometry(editor);
     editor->typewriter = enabled;
     if(enabled)
         ShowCaret(editor);
@@ -1434,6 +1548,7 @@ void EditorSetFocusMode(Editor *editor, unsigned mode)
     if(editor->focusMode == mode)
         return;
     editor->focusMode = mode;
+    ForgetCaretGeometry(editor);
     DisposeLayout(&editor->paragraph);
     InvalidateWritingSurface(editor);
 }
@@ -1445,18 +1560,19 @@ static void Select(Editor *editor, unsigned offset, Boolean trailing, Boolean ex
     unsigned oldAnchor = editor->anchor, oldCaret = editor->caret;
     Position oldTop = editor->top;
     Boolean oldSelectionValid = oldAnchor <= editor->length && oldCaret <= editor->length;
-    short oldContentTop = oldSelectionValid ? ContentTop(editor) : -32768;
     Boolean oldTrailing = editor->trailing;
+    Position oldRow = oldSelectionValid ? CaretRowAt(editor, oldCaret, oldTrailing)
+                                         : (Position){0, 0};
+    short oldContentTop = oldSelectionValid ? ContentTop(editor) : -32768;
     editor->typing = false;
     if(!extend)
         editor->anchor = offset;
     editor->caret = offset;
     editor->trailing = trailing;
-    ShowCaret(editor);
-    Rect text = TextBounds(editor);
-    Position oldRow = oldSelectionValid ? CaretRowAt(editor, oldCaret, oldTrailing)
-                                         : (Position){0, 0};
     Position newRow = CaretRow(editor);
+    if(!oldSelectionValid || oldRow.start != newRow.start || oldRow.line != newRow.line)
+        ShowCaret(editor);
+    Rect text = TextBounds(editor);
     Boolean focusRowChanged = editor->focusMode == kEditorFocusLine &&
         (oldRow.start != newRow.start || oldRow.line != newRow.line);
     Boolean focusParagraphChanged = false;
@@ -1475,19 +1591,16 @@ static void Select(Editor *editor, unsigned offset, Boolean trailing, Boolean ex
        oldTop.start != editor->top.start || oldTop.line != editor->top.line ||
        oldContentTop != ContentTop(editor) || focusRowChanged || focusParagraphChanged) {
         editor->caretOnlyPending = false;
+        ForgetCaretGeometry(editor);
         InvalidateRect(&text);
     } else {
         editor->caretOnlyPending = true;
         Position rows[2] = {oldRow, newRow};
         unsigned offsets[2] = {oldCaret, editor->caret};
         for(unsigned i = 0; i < 2; ++i) {
-            Position row = editor->top;
-            short top = ContentTop(editor);
-            while(Before(row, rows[i])) {
-                top += MetricsAt(editor, row).height;
-                if(!Step(editor, &row, true))
-                    break;
-            }
+            short top;
+            if(!VisibleRowTop(editor, rows[i], &top))
+                continue;
             LayoutSpan *span = Layout(editor, rows[i].start);
             if(span != NULL) {
                 Rect caret = CaretBounds(editor, span, rows[i], offsets[i],
@@ -3592,6 +3705,7 @@ void EditorActivate(Editor *editor, Boolean active)
 {
     editor->active = active;
     editor->caretOnlyPending = false;
+    ForgetCaretGeometry(editor);
     InvalidateRect(&editor->view);
 }
 
@@ -4334,6 +4448,33 @@ const char *EditorSmokeTest(Editor *editor, char *timing, unsigned timingSize)
     EditorDraw(editor);
     if(editor->layoutError != noErr || SourceOffset(editor, editor->top) < editor->length - 1024 ||
        GetControlValue(editor->scrollbar) != kScrollbarMax)
+        goto done;
+
+    result = "FAIL: horizontal cursor movement at the document end walked visible rows";
+    Position endRow = PositionAt(editor, editor->length - 2);
+    paragraph = Layout(editor, endRow.start);
+    if(paragraph == NULL)
+        goto done;
+    unsigned rowFirst = LineOffset(paragraph, endRow.line);
+    unsigned rowLast = paragraph->breaks[endRow.line];
+    if(rowLast <= rowFirst + 2)
+        goto done;
+    Select(editor, endRow.start + rowFirst + (rowLast - rowFirst) / 2, false, false);
+    InvalidateWritingSurface(editor);
+    EditorDraw(editor);
+    gStepCount = 0;
+    EventRecord horizontal = {.what = keyDown, .message = 0x1d};
+    EditorKey(editor, &horizontal);
+    EditorDraw(editor);
+    if(gStepCount > 1)
+        goto done;
+
+    result = "FAIL: vertical cursor movement at the document end walked visible rows";
+    gStepCount = 0;
+    EventRecord vertical = {.what = keyDown, .message = 0x1e};
+    EditorKey(editor, &vertical);
+    EditorDraw(editor);
+    if(gStepCount > 2)
         goto done;
 
     result = "FAIL: a large-note keystroke did not repaint and preserve the edit";
