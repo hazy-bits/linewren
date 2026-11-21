@@ -44,7 +44,7 @@ kbd, code {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);
   gap: clamp(2rem, 4vw, 3rem);
   align-items: center;
-  padding: clamp(3rem, 6vw, 5rem) 0 clamp(5rem, 9vw, 7rem);
+  padding: clamp(2rem, 4vw, 3rem) 0 clamp(5rem, 9vw, 7rem);
 }
 .hero-copy { min-width: 0; }
 .hero-title { display: flex; align-items: center; gap: .85rem; }
@@ -152,6 +152,7 @@ kbd, code {
 
 @media (max-width: 760px) {
   main, .site-footer { width: min(100% - 2rem, 1120px); }
+  .hero { padding-top: 1.25rem; }
   .hero-title img { width: 76px; }
   .actions { gap: .375rem; }
   .actions .button { font-size: clamp(.68rem, 3.2vw, .8rem); }
