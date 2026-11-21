@@ -3,58 +3,127 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Linewren is a Markdown and plain-text editor for PowerPC Macs running Mac OS 9 or Mac OS X.">
-  <title>Linewren · A Markdown editor for PowerPC Macs</title>
+  <meta name="description" content="Linewren is a focused Markdown and plain-text editor with search, spell checking, and distraction-free writing tools for PowerPC Macs.">
+  <title>Linewren · A quiet place to write on PowerPC Macs</title>
   <link rel="icon" href="assets/linewren-icon.png" type="image/png">
   <link rel="stylesheet" href="linewren.css">
 </head>
 <body>
-  <header class="intro">
-    <h1><img src="assets/linewren-icon.png" alt="" width="64" height="64"> Linewren</h1>
-    <p>A quiet Markdown and plain-text editor for PowerPC Macs running Mac OS 9, Tiger, or Leopard.</p>
-    <nav aria-label="Linewren">
-      <a href="#download">Download</a>
-      <a href="https://github.com/hazy-bits/linewren">Source code</a>
-    </nav>
-  </header>
   <main>
-    <figure>
-      <a href="assets/linewren-light.png">
-        <img src="assets/linewren-light.png" width="1324" height="699" alt="Linewren in light mode on Mac OS 9, with the Coast Journal folders and Before we leave highlighted in the outline">
-      </a>
-      <figcaption>Light mode on Mac OS 9</figcaption>
-    </figure>
-    <section aria-labelledby="features">
-      <h2 id="features">Writing in Linewren</h2>
-      <p>Open a folder of text files and pick up where you left off. Markdown formatting appears as you type, and the optional outline lets you jump to a heading. Quick Open finds files by name, and Find and Replace works in the current document.</p>
-      <p>Focus mode hides the sidebar and outline. Choose light or dark mode, turn on typewriter scrolling, or adjust the typeface and size. Autosave and draft recovery help protect your work.</p>
-    </section>
-    <figure>
-      <a href="assets/linewren-dark.png">
-        <img src="assets/linewren-dark.png" width="1324" height="699" loading="lazy" alt="Linewren in dark mode on Mac OS 9, with Before we leave highlighted in the outline">
-      </a>
-      <figcaption>Dark mode on Mac OS 9</figcaption>
-    </figure>
-    <section aria-labelledby="download">
-      <h2 id="download">Download</h2>
-      <p><a href="https://github.com/hazy-bits/linewren/releases">GitHub releases</a></p>
-      <dl>
-        <dt>Mac OS 9</dt>
-        <dd>Extract the ZIP, then decode <code>Linewren.bin</code> with a MacBinary-aware utility on the Mac.</dd>
-        <dt>PowerPC Mac OS X</dt>
-        <dd>Mount the DMG for Tiger or Leopard and copy Linewren to Applications.</dd>
-      </dl>
-    </section>
-    <footer>
-      <script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js"
-              data-name="bmc-button" data-slug="hazybits" data-color="#FFDD00" data-emoji=""
-              data-font="Lato" data-text="Buy me a coffee" data-outline-color="#000000"
-              data-font-color="#000000" data-coffee-color="#ffffff"></script>
-      <noscript>
-        <a href="https://buymeacoffee.com/hazybits">
-          <img src="assets/buy-me-a-coffee.png" alt="Buy Me a Coffee" width="164" height="46">
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <div class="hero-title">
+          <img src="assets/linewren-icon.png" alt="" width="96" height="96">
+          <h1>Linewren</h1>
+        </div>
+        <p class="tagline">A quiet place to write.</p>
+        <p class="lede">A modern Markdown and plain-text editor for PowerPC Macs.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/hazy-bits/linewren/releases">Download</a>
+          <a class="button" href="https://github.com/hazy-bits/linewren">View source</a>
+          <a class="coffee-button" href="https://buymeacoffee.com/hazybits">
+            <img src="assets/buy-me-a-coffee.png" alt="Buy Me a Coffee" width="164" height="46">
+          </a>
+        </div>
+        <p class="systems">Mac OS 9 · PowerPC Tiger · PowerPC Leopard</p>
+      </div>
+      <figure class="hero-shot">
+        <a href="assets/linewren-light.png">
+          <img src="assets/linewren-light.png" width="1324" height="699" alt="Linewren in light mode on Mac OS 9, showing a folder sidebar, styled Markdown, and heading outline">
         </a>
-      </noscript>
+        <figcaption>Light mode on Mac OS 9</figcaption>
+      </figure>
+    </section>
+
+    <section class="feature-intro" id="features" aria-labelledby="features-title">
+      <p class="eyebrow">Writing tools</p>
+      <h2 id="features-title">Writing in Linewren</h2>
+      <p>Linewren brings the conveniences of a modern writing app to the machines you still enjoy using.</p>
+    </section>
+
+    <section class="feature-grid" aria-label="Linewren features">
+      <article class="feature-card search-card">
+        <div class="mini-window" aria-hidden="true">
+          <div class="mini-title">Find and Replace</div>
+          <div class="find-row">
+            <div class="search-field">harbour</div>
+            <span class="match-count">2 of 3</span>
+            <span class="mini-button">Previous</span>
+            <span class="mini-button">Next</span>
+          </div>
+          <div class="find-row replace-row">
+            <div class="search-field">harbor</div>
+            <span class="mini-button">Replace</span>
+            <span class="mini-button">Replace All</span>
+          </div>
+        </div>
+        <p class="kicker">Find and replace</p>
+        <h3>Find the right words.</h3>
+        <p><kbd>⌘F</kbd> searches the current document, steps through every match, and replaces one or all occurrences. Select text first to make it the query. <kbd>⌘P</kbd> still opens any file by name.</p>
+      </article>
+
+      <article class="feature-card focus-card">
+        <div class="focus-demo" aria-hidden="true">
+          <p>We took the early train to the harbour.</p>
+          <p class="in-focus">The town was still half asleep.</p>
+          <p>Coffee waited beyond the station.</p>
+        </div>
+        <p class="kicker">Focus modes</p>
+        <h3>Give one thought the room.</h3>
+        <p>Focus Layout clears away the chrome. Line Focus and Paragraph Focus gently dim the rest. Typewriter Scrolling keeps the sentence you are shaping in a comfortable place.</p>
+      </article>
+
+      <article class="feature-card spelling-card">
+        <div class="spelling-demo" aria-hidden="true">
+          <span>A quiet place to </span><span class="misspelling">wirte</span><span>.</span>
+          <div class="suggestion">write</div>
+        </div>
+        <p class="kicker">Spell checking</p>
+        <h3>Catch the small things.</h3>
+        <p>Check on demand or as you type. Review suggestions, ignore a word in one document, and keep a language per file. Mac OS 9 includes US English and Russian dictionaries.</p>
+      </article>
+
+      <article class="feature-card markdown-card">
+        <div class="markdown-demo" aria-hidden="true">
+          <strong><span>#</span> Notes from the coast</strong>
+          <p>The <i>*early train*</i> to the harbour.</p>
+          <p><span>- [x]</span> Pick up a postcard</p>
+        </div>
+        <p class="kicker">Live Markdown</p>
+        <h3>Styled, never hidden.</h3>
+        <p>Headings, emphasis, links, quotes, lists, code, tables, tasks, and strikethrough gain structure as you type. The Markdown source stays visible and the file stays plain text.</p>
+      </article>
+    </section>
+
+    <section class="dark-section" aria-labelledby="personal-title">
+      <div class="dark-copy">
+        <p class="eyebrow">Your display, your pace</p>
+        <h2 id="personal-title">Feels at home on a classic Mac.</h2>
+        <p>Switch between light and dark themes, choose any installed typeface and point size, and show words, characters, or no count at all.</p>
+        <ul class="compact-list">
+          <li>Sidebar and outline toggle independently</li>
+          <li>Resizable windows and centered writing column</li>
+          <li>Keyboard selection, word movement, and list continuation</li>
+        </ul>
+      </div>
+      <figure>
+        <a href="assets/linewren-dark.png">
+          <img src="assets/linewren-dark.png" width="1324" height="699" loading="lazy" alt="Linewren in dark mode on Mac OS 9, showing the same folder, Markdown document, and heading outline">
+        </a>
+        <figcaption>Dark mode on Mac OS 9</figcaption>
+      </figure>
+    </section>
+
+    <section class="download-section" id="download" aria-labelledby="download-title">
+      <div>
+        <p class="eyebrow">Ready when your PowerPC Mac is</p>
+        <h2 id="download-title">Download Linewren</h2>
+        <p>Free and open source under the MIT License.</p>
+        <a class="button primary" href="https://github.com/hazy-bits/linewren/releases">Get the latest release</a>
+      </div>
+    </section>
+    <footer class="site-footer">
+      <p>Linewren is a personal project for old Macs and new words.</p>
     </footer>
   </main>
 </body>

@@ -1,8 +1,9 @@
 <h1><img src="site/assets/linewren-icon.png" alt="" width="96" height="96" align="absmiddle"> Linewren</h1>
 
-A quiet Markdown and plain-text editor for PowerPC Macs. Linewren pairs a classic
-Mac interface with live Markdown styling, a centered writing column, and
-folders of ordinary UTF-8 files.
+A quiet, capable Markdown and plain-text editor for PowerPC Macs. Linewren
+combines a classic Mac interface with live Markdown styling, fast navigation,
+distraction-free writing tools, and spell checking—all while keeping your work
+in ordinary text files.
 
 <a href="site/assets/linewren-light.png?raw=true"><img src="site/assets/linewren-light.png" width="662" alt="Linewren in light mode on Mac OS 9"></a>
 
@@ -18,20 +19,52 @@ folders of ordinary UTF-8 files.
 downloads. The Classic build is exercised on Mac OS 9.2.2. The Carbon build
 has been used on PowerPC Tiger. Leopard validation is pending.
 
-## Write and navigate
+## What makes Linewren useful
 
+### Find anything without leaving the keyboard
+
+- Press **⌘P** to quickly open any file in an attached folder by name.
+- Press **⌘F** to search the current document, move through every match, and
+  replace one or all occurrences. A selection becomes the initial query.
+- Browse folders in the sidebar, jump through the clickable heading outline,
+  and reopen recent files from the File menu.
+
+### Make room for the words
+
+- **Focus Layout** hides the sidebar, outline, and footer for a clean writing
+  surface.
+- Independent **Line Focus** and **Paragraph Focus** modes dim the surrounding
+  text without changing it.
+- **Typewriter Scrolling** keeps the current line comfortably positioned.
+- Choose a light or dark theme, any installed typeface, and the point size that
+  suits the display. Show a word count, character count, or neither.
+
+### Catch mistakes as you write
+
+- Check the whole document on demand or enable **Check Spelling as You Type**.
+- Review mistakes one by one, choose a suggestion from the spelling window or
+  context menu, and ignore a word for the current document.
+- Spelling checks prose while skipping Markdown code and link destinations.
+- Mac OS 9 includes US English and Russian dictionaries. Tiger and Leopard use
+  the system spelling service, with the language remembered per file.
+
+### Markdown that still looks like Markdown
+
+- Headings, emphasis, links, quotes, lists, code, tables, task lists, and
+  strikethrough are styled live in the editor while the source stays visible.
+- Apply bold, italic, links, headings, quotes, lists, and tasks from the Edit
+  menu. Lists continue and nest naturally as you type.
 - Open Markdown or plain text from Finder, the File menu, or an attached folder.
-- Use **⌘P** to find a file by name and **⌘F** to find or replace text in the
-  current file. Select a word before opening Find to use it as the query.
-- Toggle the sidebar with **⌘1** and the clickable heading outline with **⌘2**.
-  Focus Layout hides both and leaves the writing surface.
-- Choose light or dark mode, change the typeface and size, or turn on typewriter
-  scrolling. Independent line and paragraph focus modes dim the surrounding
-  text. Click the footer count to switch between words and characters.
-- Format Markdown from the Edit menu. Linewren groups undo, saves edited files
-  safely, and recovers surviving drafts separately after an interrupted session.
-- Control-click a sidebar item to rename it, reveal it in Finder, or move it to
-  the Trash with confirmation.
+  Files remain ordinary UTF-8 text that other tools can read.
+
+### Built for real files
+
+- Existing files autosave through safe File Manager exchange, with protection
+  against overwriting changes made by another application.
+- Undo and redo group related edits. Surviving unsaved drafts are recovered
+  separately after an interrupted session.
+- Control-click a sidebar item to create or rename a Markdown file, reveal it in
+  Finder, remove it from the sidebar, or move it to the Trash with confirmation.
 
 ## Build and test
 
